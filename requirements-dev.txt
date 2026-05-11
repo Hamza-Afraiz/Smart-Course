@@ -1,0 +1,11 @@
+-r requirements.txt           # include all production deps
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0        # async test support
+pytest-cov==6.0.0             # coverage reports
+
+# ── Code Quality ──────────────────────────────────────────────────────────────
+black==24.10.0                # formatter
+isort==5.13.2                 # import sorter
+mypy==1.13.0                  # type checker

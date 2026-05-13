@@ -61,13 +61,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 from app.routers.auth import router as auth_router
+from app.routers.courses import router as courses_router
+from app.routers.users import router as users_router
 
 app.include_router(auth_router, prefix="/api/v1/auth")
-
-# from app.routers.users import router as users_router
-# from app.routers.courses import router as courses_router
-# app.include_router(users_router,   prefix="/api/v1/users",   tags=["Users"])
-# app.include_router(courses_router, prefix="/api/v1/courses", tags=["Courses"])
+app.include_router(users_router, prefix="/api/v1/users")
+app.include_router(courses_router, prefix="/api/v1/courses")
 
 # ── Health Check ──────────────────────────────────────────────────────────────
 

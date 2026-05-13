@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.user import UserRole
 
@@ -15,3 +15,8 @@ class UserResponse(BaseModel):
     role: UserRole
     is_active: bool
     created_at: datetime
+
+
+class UserUpdateRequest(BaseModel):
+    full_name: str | None = Field(None, max_length=255)
+    password: str | None = Field(None, min_length=8)

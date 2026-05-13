@@ -186,12 +186,12 @@ smart-course/
 
 ## Definition of Done — Week 1
 
-- [ ] `docker-compose up` starts all services cleanly
-- [ ] Alembic migration applies schema from scratch
-- [ ] All user endpoints return correct responses (tested via Swagger or curl)
-- [ ] All course + module + lesson endpoints return correct responses
-- [ ] Role-based access control enforced (student cannot create courses)
-- [ ] Ownership check enforced (instructor cannot edit another's course)
-- [ ] At least one test per major flow passing
-- [ ] README written with setup instructions
-- [ ] Codebase follows Router → Service → Repository pattern
+- [x] `docker-compose up` starts all services cleanly
+- [x] Alembic migration applies schema from scratch
+- [x] All user endpoints return correct responses (tested via Swagger or curl)
+- [x] All course + module + lesson endpoints return correct responses
+- [x] Role-based access control enforced (student cannot create courses)
+- [x] Ownership check enforced (instructor cannot edit another's course)
+- [x] At least one test per major flow passing
+- [x] README written with setup instructions
+- [x] Codebase follows Router → Service → Repository pattern

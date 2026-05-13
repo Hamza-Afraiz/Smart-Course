@@ -20,5 +20,21 @@ class CourseNotFoundError(SmartCourseError):
     pass
 
 
+class ModuleNotFoundError(SmartCourseError):
+    pass
+
+
+class LessonNotFoundError(SmartCourseError):
+    pass
+
+
+class OrderIndexConflictError(SmartCourseError):
+    """Raised when trying to insert a module/lesson at an order_index already taken."""
+
+
+class InvalidStatusTransitionError(SmartCourseError):
+    pass
+
+
 class ForbiddenError(SmartCourseError):
     pass

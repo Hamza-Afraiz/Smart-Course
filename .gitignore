@@ -22,7 +22,14 @@ CLAUDE.md
 .claude/
 
 # Alembic — generated migration files are committed, but not cache
-alembic/__pycache__/
+backend/alembic/__pycache__/
+
+# Frontend (Node/Vite)
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-error.log*
 
 # IDE
 .vscode/

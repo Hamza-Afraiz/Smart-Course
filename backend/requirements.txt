@@ -1,0 +1,27 @@
+# ── Web Framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12      # required for OAuth2 form-based login in Swagger
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+psycopg[async]==3.2.3         # async PostgreSQL driver (psycopg3, glibc compatible)
+alembic==1.14.0
+
+# ── Validation & Config ───────────────────────────────────────────────────────
+pydantic==2.10.2
+pydantic-settings==2.6.1
+email-validator==2.3.0         # required for Pydantic EmailStr validation
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0   # JWT encode/decode
+bcrypt==4.2.1                      # password hashing (used directly — passlib 1.7.x is incompatible with bcrypt 4.x)
+
+# ── HTTP Client ───────────────────────────────────────────────────────────────
+httpx==0.28.0                 # async HTTP client (replaces requests in async context)
+
+# ── Async Utilities ───────────────────────────────────────────────────────────
+anyio==4.7.0
+
+# ── Temporal (Week 2 Chunk B — publishing workflow) ───────────────────────────
+temporalio==1.27.0

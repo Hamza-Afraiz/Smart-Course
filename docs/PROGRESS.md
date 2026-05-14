@@ -2,8 +2,8 @@
 
 Single source of truth for what's done and what's next across all 5 weeks. Update this doc whenever a milestone moves.
 
-**Last updated:** 2026-05-13
-**Current focus:** Week 1 complete — ready for mentor review
+**Last updated:** 2026-05-14
+**Current focus:** Week 2 complete + React UI added for end-to-end testing — Week 3 (events + observability) next
 
 ---
 
@@ -27,9 +27,9 @@ Single source of truth for what's done and what's next across all 5 weeks. Updat
 | Course CRUD — 5 endpoints | ✅ | Create, list, get, update, soft-delete |
 | Modules — POST + GET (list) | ✅ | `order_index` uniqueness enforced at DB level |
 | Lessons — POST | ✅ | |
-| Status transitions enforced | ✅ | `draft → published`, `draft/published → archived` only |
+| Status transitions enforced | ✅ | Publish via `POST .../publish` (Temporal); PATCH: `draft → archived`, `published → archived` only |
 | Ownership checks (service layer) | ✅ | `_can_modify(user, course)` |
-| Test suite | ✅ | 27 tests passing, function-scoped DB isolation |
+| Test suite | ✅ | 47+ tests passing (users, courses, enrollments, Temporal publish), function-scoped DB isolation |
 | README + architecture diagram | ✅ | |
 | `docs/API.md` reference | ✅ | |
 | `docs/SCHEMA.md` ER diagram | ✅ | |
@@ -43,27 +43,47 @@ Single source of truth for what's done and what's next across all 5 weeks. Updat
 
 ---
 
-### 🟡 Week 2 — Enrollment + Publishing Workflow — ⬜ NOT STARTED
+### 🟢 Week 2 — Enrollment + Publishing Workflow — ✅ COMPLETE
+
+#### Chunk A — Enrollment system — ✅ COMPLETE
 
 | Item | Status | Notes |
 |---|---|---|
-| `POST /courses/{id}/enroll` endpoint | ⬜ | Student-only |
-| Atomic enrollment + progress init in one transaction | ⬜ | If progress init fails, no enrollment row |
-| Duplicate enrollment caught by DB UNIQUE constraint | ⬜ | Model is ready, endpoint isn't |
-| `GET /enrollments/me` — student's enrollments | ⬜ | |
-| `POST /enrollments/{id}/progress/{lesson_id}` — mark lesson complete | ⬜ | |
-| Enrollment capacity check (`max_students`) | ⬜ | Race-safe — use `SELECT ... FOR UPDATE` or count-after-insert |
-| Temporal SDK installed + worker running | ⬜ | `docker-compose --profile week2 up -d` |
-| Publishing workflow (Temporal) | ⬜ | Multi-step: validate → process lessons → publish |
-| Compensation logic | ⬜ | If publish fails, revert draft status |
-| `POST /courses/{id}/publish` — kicks off workflow | ⬜ | Returns workflow id |
-| Tests for enrollment race conditions | ⬜ | Concurrent requests for last seat |
-| Tests for workflow happy path + compensation | ⬜ | |
+| `POST /courses/{id}/enroll` endpoint | ✅ | Student-only, returns 201 EnrollmentResponse |
+| Atomic enrollment inside DB transaction | ✅ | `SELECT ... FOR UPDATE` on courses row serializes capacity check + insert |
+| Duplicate enrollment caught by DB UNIQUE constraint | ✅ | `IntegrityError` → `AlreadyEnrolledError` → 409 |
+| `GET /enrollments/me` — student's enrollments | ✅ | Includes course title + progress summary (`total/completed/percent`) |
+| `POST /enrollments/{id}/progress/{lesson_id}` — mark lesson complete | ✅ | Idempotent — second call returns the same row with 201, no 409 |
+| Enrollment capacity check (`max_students`) | ✅ | Row-lock + count, validated by concurrent race test (10 racers, cap=3 → exactly 3 succeed) |
+| Auto-completion of enrollment | ✅ | Last lesson completion flips status=completed + completed_at in same txn |
+| Tests for enrollment race conditions | ✅ | `test_concurrent_enrollment_respects_capacity` via `asyncio.gather` |
+
+#### Chunk B — Temporal publishing workflow — ✅ COMPLETE
+
+| Item | Status | Notes |
+|---|---|---|
+| Temporal SDK installed + worker running | ✅ | `temporal`, `temporal-ui` + `worker` all in `docker-compose up -d` (one image — see `backend/Dockerfile`) |
+| Publishing workflow (Temporal) | ✅ | `validate_course_activity` → `process_lessons_activity` → `mark_published_activity` |
+| Compensation logic | ✅ | If `mark_published` fails after process, `delete_processed_data_activity` clears `processed_at` |
+| `POST /courses/{id}/publish` — kicks off workflow | ✅ | 202 + `{ workflow_id }`; duplicate → 409 |
+| `GET /courses/{id}/publish/status` | ✅ | Maps Temporal describe → status payload |
+| `courses.processed_at` + migration | ✅ | Set in process activity (placeholder for Week 4 pipeline) |
+| Tests for workflow happy path + compensation | ✅ | `tests/test_temporal_publish.py` + `publish_helpers` |
 
 **Deliverables (from EXECUTION_GUIDELINES.md):**
-- [ ] Enrollment flow working reliably
-- [ ] Workflow orchestration integrated
-- [ ] Course state transitions handled
+- [x] Enrollment flow working reliably
+- [x] Workflow orchestration integrated
+- [x] Course state transitions handled (PATCH cannot set `published`; use publish endpoint)
+
+#### Frontend UI (testing client, not on the original week plan) — ✅ COMPLETE
+
+| Item | Status | Notes |
+|---|---|---|
+| Repo split into `backend/` + `frontend/` | ✅ | All Python moved under `backend/`; infra `docker-compose.yml` stays at root |
+| React + Vite + TypeScript SPA | ✅ | axios client, `AuthContext`, role-aware routing + guards |
+| Stateless-JWT auth model on the client | ✅ | Token in `localStorage`; role always re-read from `/users/me`, never trusted from the token |
+| Pages: Login, Register, Catalog, CourseDetail, MyCourses, MyEnrollments, Profile | ✅ | Student + instructor/admin flows end-to-end |
+| Supporting backend read endpoints | ✅ | `GET /courses/mine`, `GET /courses/{id}/modules/{mid}/lessons`, `GET /enrollments/{eid}/progress` — expose existing data the UI needs |
 
 ---
 

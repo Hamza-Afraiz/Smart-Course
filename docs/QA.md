@@ -487,6 +487,8 @@ users, courses, modules, lessons, enrollments, progress, certificates. Seven tab
 
 ### Q: Why not put analytics in MongoDB instead of PostgreSQL?
 
+> **⚠️ Partially superseded — 2026-05-14.** The conclusion *"analytics **metrics** → Postgres SQL"* still stands. But the closing line *"MongoDB's job is lesson_chunks"* does **not** — chunks moved to Postgres/pgvector and MongoDB's job became the raw interaction/event log. See **"Final storage architecture (resolved)"** at the end of this session log.
+
 **A:**
 
 MongoDB can handle analytics — but PostgreSQL wins for SmartCourse's specific metrics.
@@ -510,6 +512,8 @@ MongoDB's job in this project is lesson_chunks storage — where it genuinely fi
 ---
 
 ### Q: Why store analytics events in PostgreSQL? Is that in the PRD?
+
+> **⚠️ Resolved — 2026-05-14.** This entry correctly deferred the storage decision; it has since been made. The granular **interaction/event log** lives in **MongoDB**; the **9 dashboard metrics** are SQL rollups in Postgres. See **"Final storage architecture (resolved)"** at the end of this session log.
 
 **A:**
 
@@ -593,6 +597,8 @@ A student completes lessons. All lessons done → enrollment complete → certif
 
 ### Q: Are chunks and embeddings the same thing? Where do they live?
 
+> **⚠️ Superseded — 2026-05-14.** Chunks and embeddings are still separate *concepts*, but they no longer live in MongoDB — both moved to **Postgres + pgvector** (a chunk and its embedding are one row). See **"Final storage architecture (resolved)"** at the end of this session log.
+
 **A:**
 
 They are separate concepts and both belong in MongoDB (Week 4), not PostgreSQL.
@@ -620,6 +626,8 @@ The `lesson_id` in MongoDB references the Postgres lesson — that's the bridge 
 ---
 
 ### Q: Where does content get stored during the publishing workflow (Week 2)?
+
+> **⚠️ Superseded — 2026-05-14.** The workflow steps are still right, but the storage target changed: raw chunks are written to **Postgres** (alongside their embeddings via pgvector), **not** MongoDB. MongoDB instead receives the interaction/event log. See **"Final storage architecture (resolved)"** at the end of this session log.
 
 **A:**
 
@@ -1330,3 +1338,552 @@ POST /courses  → DBSession + InstructorUser → full chain runs:
 FastAPI reads each route's signature and only runs declared dependencies. Unlike Express `app.use()` which runs globally for all routes (requiring manual exclusions for public endpoints), FastAPI dependencies are per-route and precise.
 
 ---
+
+## Session 3 — 2026-05-13
+
+---
+
+### Q: In `lock_course_for_enrollment` we call `.with_for_update()` — how is this a transaction, how does the lock work, and is it Postgres-specific?
+
+**A:**
+
+**Where the transaction comes from.** The function never calls `db.begin()`, yet a transaction exists. SQLAlchemy's `AsyncSession` uses **implicit/lazy transactions** — the first statement on a fresh session automatically issues `BEGIN`. The transaction stays open until `commit()` or `rollback()`. The session-per-request pattern in `app/database.py` then commits when the route handler returns successfully, or rolls back on exception:
+
+```python
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()        # <-- releases the FOR UPDATE lock
+        except Exception:
+            await session.rollback()      # <-- also releases it
+            raise
+```
+
+So the flow during an enroll is:
+```
+1st query (lock_course_for_enrollment)  -> implicit BEGIN, row lock acquired
+count_active(...)                       -> same txn, lock still held
+enrollment_repo.create(...)             -> same txn
+handler returns                         -> get_db() commits -> lock released
+```
+
+**What `.with_for_update()` emits.** On PostgreSQL it compiles to:
+```sql
+SELECT courses.* FROM courses WHERE courses.id = $1 FOR UPDATE
+```
+`FOR UPDATE` is standard SQL (SQL:1992) and works on Postgres / MySQL InnoDB / Oracle, but with **different semantics on each engine**. We're targeting Postgres.
+
+**The lock mechanism (Postgres-specific details).** This is a **row-level exclusive lock**:
+- Postgres marks the locked row by writing the locker's transaction ID into the tuple's hidden `xmax` field.
+- Other transactions doing `UPDATE`, `DELETE`, `SELECT FOR UPDATE`, or `SELECT FOR NO KEY UPDATE` on the **same row** block waiting for us.
+- Plain `SELECT` (no `FOR UPDATE`) is **not** blocked — Postgres MVCC lets readers see the previous committed version. Read traffic is unaffected.
+- Lock is released automatically on `COMMIT` / `ROLLBACK`. No `UNLOCK` exists.
+
+Postgres has a family of row-level locks; we picked the strongest:
+
+| Mode | What it blocks on the same row | When to use |
+|---|---|---|
+| `FOR UPDATE` (chosen) | other FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE / UPDATE / DELETE | strict mutual exclusion |
+| `FOR NO KEY UPDATE` | same, but doesn't conflict with FK checks | non-key column updates with better FK concurrency |
+| `FOR SHARE` | UPDATE / DELETE / FOR UPDATE — but multiple FOR SHARE can co-hold | "read and freeze, but other readers welcome" |
+| `FOR KEY SHARE` | only key-changing UPDATEs and DELETE | weakest; used internally by FK validation |
+
+We use `FOR UPDATE` because anything weaker (e.g. `FOR SHARE`) would let two transactions both pass the capacity check.
+
+**Why the lock is necessary — the race.** Classic read-modify-write race on the capacity check. With `max_students=50` and current count=49:
+```
+T1: SELECT count(*) ... -> 49
+T2: SELECT count(*) ... -> 49        (both see same snapshot)
+T1: 49 < 50, INSERT, COMMIT          -> count is now 50
+T2: 49 < 50, INSERT, COMMIT          -> count is now 51   BUG (cap violated)
+```
+With `FOR UPDATE` on the courses row:
+```
+T1: SELECT * FROM courses WHERE id=X FOR UPDATE -> lock acquired
+T2: SELECT * FROM courses WHERE id=X FOR UPDATE -> blocks waiting on T1
+T1: count=49, INSERT, COMMIT                     -> lock released
+T2: unblocks, count=50, full -> CourseFullError  -> 409
+```
+
+**Parent-row-as-gate pattern.** Note that we lock the **courses row** (parent), not the enrollments rows (children). We use the parent row as a mutex for any operation needing a consistent count of its children. Works because:
+- `courses.id` is a stable single-row target — cheap.
+- Every enrollment for that course funnels through the same lock.
+- Plain reads on the course row aren't blocked, so this doesn't hurt read traffic.
+
+**Deadlock note.** Postgres detects deadlocks automatically (`deadlock_timeout`, default 1s) and kills one victim. Our flow only locks one course row per request — no deadlock risk. If we ever lock two course rows in one transaction (e.g. "transfer enrollment between courses"), acquire them in canonical order (e.g. UUID ascending) to prevent A→B / B→A cycles.
+
+**Alternatives we didn't pick:**
+
+| Approach | Why not |
+|---|---|
+| Advisory locks (`pg_advisory_xact_lock`) | Faster but app-specific labels, less natural visibility in `pg_locks` |
+| Optimistic concurrency (version column + retry) | Adds retry loop in app code; more failure modes; overkill at current scale |
+| Denormalized `active_count` column with `UPDATE ... WHERE active_count < max RETURNING` | Single atomic statement, but adds a counter to maintain on every insert/delete/status change |
+| Serializable isolation level | Too coarse — lots of `SerializationFailure` retries under contention |
+
+`FOR UPDATE` is the sweet spot at current scale: correct, idiomatic, uses the DB the way it was designed.
+
+---
+
+### Q: Will transactions also be used in the analytics part (Week 3)?
+
+**A:** Yes — but in a fundamentally different way. The analytics layer's transactions are separate, smaller, and decoupled from the original business transaction. This split is intentional.
+
+**Two worlds of transactions in this system:**
+
+| World | Why it uses a transaction | Example |
+|---|---|---|
+| Write path (enrollment, publish) | Atomicity + locking for races | `BEGIN -> FOR UPDATE -> check -> INSERT -> COMMIT` |
+| Analytics writes (Celery consumer) | Idempotency + atomic counter update | `BEGIN -> mark event processed -> UPDATE counter -> COMMIT` |
+| Analytics reads (dashboard query) | Consistency-of-snapshot (Postgres MVCC) | Single `SELECT` — implicit txn, no lock needed |
+
+**Why analytics doesn't share the enrollment transaction (the "fat transaction" anti-pattern):**
+
+```
+BEGIN
+  INSERT enrollment
+  UPDATE course_stats SET enrolled_count = enrolled_count + 1   -- analytics
+  UPDATE student_stats SET courses_count = courses_count + 1    -- analytics
+  INSERT analytics_event (...)                                  -- analytics
+COMMIT
+```
+
+Problems:
+1. The `FOR UPDATE` lock on `courses` is held longer -> fewer concurrent enrolls possible (lock contention).
+2. An analytics-side failure (constraint mismatch on a stat table) kills the user's enrollment with a 500 — for a reporting bug.
+3. Analytics tables become hot — every enrollment serializes through them too.
+4. Analytics can't scale independently — stuck in the same Postgres write path as enrollments.
+
+**The async split (Week 3 pattern):**
+
+```
+TXN 1 (sync, fast, locks):
+  INSERT enrollment
+  COMMIT
+  -> emit Kafka event "user.enrolled"
+
+TXN 2 (async, in Celery worker, ms later):
+  BEGIN
+    mark event processed (idempotency)
+    UPDATE course_stats SET enrolled_count = enrolled_count + 1
+  COMMIT
+```
+
+The user's enrollment is durable in milliseconds. If analytics is slow or broken, the user never knows.
+
+**Three transaction patterns Week 3 will use:**
+
+**1. Transactional outbox** — solves "what if Kafka emit fails after commit?":
+```sql
+BEGIN;
+  INSERT INTO enrollments (...);
+  INSERT INTO outbox_events (event_type, payload, idempotency_key);   -- same txn!
+COMMIT;
+-- separate poller reads outbox -> publishes to Kafka -> marks sent
+```
+The event is committed atomically with the business state. You can't have an enrollment without the corresponding event eventually being published. This is one of the few places analytics-related work sits inside the source transaction — but it's just the *intent to publish*, not the analytics computation.
+
+**2. Idempotent consumer** — solves "what if Kafka redelivers the same event?":
+```sql
+BEGIN;
+  INSERT INTO processed_events (event_id) ON CONFLICT DO NOTHING;
+  -- if 0 rows inserted, we already processed this -> bail
+  UPDATE course_stats SET enrolled_count = enrolled_count + 1 WHERE course_id = ?;
+COMMIT;
+```
+The transaction here is for atomicity of "mark processed AND update aggregate" together. Without that, a crash between the two leaves you double-counting on retry.
+
+**3. Optimistic concurrency on counters** (when contention is high):
+```sql
+UPDATE course_stats
+SET enrolled_count = enrolled_count + 1, version = version + 1
+WHERE course_id = ? AND version = ?
+```
+If `version` changed, retry. Lighter than `FOR UPDATE` because there's no lock — readers and writers don't block each other. Useful when many consumers update the same aggregate row.
+
+**TL;DR:**
+
+| Question | Answer |
+|---|---|
+| Will analytics use transactions? | Yes. |
+| The same transaction as enrollment? | No. That's the whole point of async analytics. |
+| For the same reason (race control)? | No. For idempotency, atomic counter updates, exactly-once event processing. |
+| Will some "analytics-adjacent" work sit inside the enrollment txn? | Yes — the transactional outbox pattern. But it writes intent-to-publish, not analytics state. |
+
+---
+
+### Q: If T1 (enrollment) commits but T2 (analytics counter update) fails, is T1 rolled back / withheld?
+
+**A:** **No. T1 stays committed.** Once `COMMIT` returns success, the data is durable — the "D" in ACID. There is no mechanism to un-commit; you can only write a compensating transaction, and for analytics failures the business does NOT want that.
+
+**Why withholding T1 would be wrong** — it re-couples the two services and brings back every problem we split them to avoid:
+
+1. A bug in the analytics service blocks all enrollments (user-facing 500s for a reporting bug).
+2. Downed Kafka prevents users from enrolling — your "Kafka for resilience" claim becomes "Kafka is a hard dependency."
+3. Hot analytics tables cause lock contention back on the enrollment path.
+4. Latency rises — every enrollment waits for aggregation.
+
+This is the **distributed monolith** anti-pattern: looks distributed but fails like a monolith because failures cascade across components. The system is deliberately designed so enrollments succeed even if analytics is down for a week. Analytics catches up later.
+
+**What actually happens when T2 fails:**
+
+| Failure | What happens | Recovery |
+|---|---|---|
+| Kafka publish fails right after commit (network blip) | Without outbox: event is LOST -> dual-write problem | **Transactional outbox** — write event in same txn as T1; poller retries |
+| Celery worker crashes mid-update | T2 auto-rollback; message ack not sent | Another worker picks up; idempotency table prevents double-count |
+| Bug makes T2 fail repeatedly | Hits retry limit -> dead-letter queue; alert fires | Engineer fixes + replays DLQ; enrollments unaffected meanwhile |
+| Analytics DB unavailable | Consumers can't commit -> queue backs up (backpressure) | Drain when DB returns; dashboard shows lag until caught up |
+| Kafka redelivers same event | T2 runs again | Idempotency table catches duplicate via `INSERT ON CONFLICT DO NOTHING` |
+
+Pattern is always: **forward progress only, no rollback of T1**. Eventually consistent, not transactionally consistent across components — a deliberate trade.
+
+**The three safety nets that make "eventually consistent" actually safe (Week 3):**
+
+1. **Transactional outbox** — closes the dual-write hole. Write the event in the same DB txn as T1; a separate poller publishes to Kafka with retries. You cannot have an enrollment without the corresponding event eventually reaching Kafka.
+
+2. **Idempotent consumer** — closes the redelivery hole. `INSERT INTO processed_events (event_id) ON CONFLICT DO NOTHING` inside T2; skip if already processed. Kafka can redeliver a thousand times; the count stays correct.
+
+3. **Reconciliation job** — closes the "drift forever" hole. A nightly job recomputes aggregates from the source of truth:
+   ```sql
+   UPDATE course_stats cs
+   SET enrolled_count = (SELECT count(*) FROM enrollments
+                         WHERE course_id = cs.course_id AND status = 'active');
+   ```
+   Source of truth (T1's tables) is always right; derived data is always recoverable.
+
+**Mental model (CAP theorem in practice):**
+
+- **Strong consistency** on source of truth (enrollments table) -> guarded by T1 with `FOR UPDATE`.
+- **Eventual consistency** on derived data (analytics) -> guarded by T2 + idempotency + reconciliation.
+- **Availability** of both — neither blocks on the other.
+
+Saga pattern at the data layer: forward-only progress, with compensating actions that live in the analytics replay logic — NOT in undoing the user's enrollment.
+
+**Anti-patterns to reject (someone will suggest all three eventually):**
+
+| Suggestion | Why it's wrong |
+|---|---|
+| Use two-phase commit (2PC) across DB and Kafka | 2PC requires a coordinator; Kafka doesn't fully support it; slow; makes every component a SPOF. Industry moved away from it. |
+| Reverse the enrollment if analytics fails | Punishes the user for an internal bug. Also racy — user may have done other things by then. |
+| Block the enrollment response until T2 confirms | Destroys the latency benefit. You've rebuilt the fat transaction. |
+
+---
+
+### Q: According to PRD and Part A, do we have two transactions — one for enrollment and one for analytics?
+
+**A:** **Yes, in the sense that matters:** the **durable enrollment** is committed in the **API request’s PostgreSQL transaction(s)** (source of truth). **Analytics updates** are applied in **separate transaction(s)** on the async path (after the event is consumed), not rolled back with the user’s enroll if analytics fails.
+
+**Nuance — transactional outbox (Week 3):** You may put an **outbox row** (intent to publish) in the **same** DB transaction as the enrollment insert so you never lose the event. That is still not “run full analytics in T1” — the **aggregate / metric write** stays in **T2**. So: one txn for “user is enrolled + event recorded for delivery”; another txn(s) for “dashboards reflect it.”
+
+**PRD alignment:** [PRD.md](PRD.md) **NFR-C05** and the Enrollment Workflow bullets describe enrollment as independent commit and analytics as async / eventual consistency.
+
+---
+
+### Q: Before going further — why do we need Temporal workers and Celery?
+
+**A:**
+
+**Why any workers at all?** FastAPI returns quickly; users should not wait on indexing, email, multi-step publish, or analytics. Workers run **outside** the request: retries, backoff, and crashes do not become user-facing 500s on the critical path.
+
+**Temporal (workflow + worker)** — for **orchestrated, stateful, multi-step** processes where order, retries, and **compensations** matter:
+
+- **Course publishing** (Part A): validate → process content → mark published; if step 3 fails, undo step 2 in reverse order. Temporal keeps **durable workflow state**, replays workflow code safely, and retries **activities** with policies you configure.
+- You **could** fake this in Celery with chains and manual saga tables, but you re-implement persistence, dedupe, timeouts, and recovery. Temporal is built for that.
+
+**Celery (task workers)** — for **discrete, idempotent jobs** that do not need a persisted multi-step graph:
+
+- Send welcome email (stub: log to console).
+- Bump analytics aggregates, warm cache, one-off maintenance.
+- Simple “do this once per event” work with RabbitMQ as broker.
+
+**Why not only Celery?** Celery is great at “run task X,” weak at “guarantee this exact 5-step saga with compensations across partial failures and process restarts” without a lot of custom code.
+
+**Why not only Temporal?** Overkill for a one-shot email or a single counter update; more moving parts and operational surface for trivial work.
+
+**Rule of thumb (from [CLAUDE.md](../CLAUDE.md)):**
+
+| Need | Tool |
+|------|------|
+| Single DB transaction (enroll + lock) | Postgres + `AsyncSession`, no worker |
+| One side-effect, retry independently | **Celery** |
+| Multi-step with state + compensations | **Temporal** |
+| Long-running / human approval | **Temporal** |
+
+**“Temporal worker” vs “Celery worker”:** both are separate processes that pull work from a queue — but Temporal’s queue is **workflow and activity tasks** with a server that records history; Celery’s queue is **messages** for individual tasks. Different products, complementary in this stack (Kafka can still fan out events; Celery can consume them or run scheduled jobs).
+
+---
+
+### Q: How do Kafka, Celery, and Temporal fit together according to our PRD? What is the Saga pattern?
+
+**A — how the three fit the PRD (Part A):**
+
+Our [PRD](PRD.md) asks for: (1) **publishing** without corrupting state on partial failure, (2) **enrollment-driven** analytics and notifications **async**, (3) **event-driven** behavior with **no double-processing**, **traceability**, and **spike handling**.
+
+Think in **three lanes**:
+
+| Lane | Tool | PRD it serves |
+|------|------|----------------|
+| **Orchestrated workflows** | **Temporal** | **Content publishing** (FR §2): multi-step pipeline (validate → process → mark published / ready), compensations if something fails, durable state across crashes. The **Temporal worker** runs workflow + activity code the server schedules. |
+| **Event fan-out** | **Kafka** | **Distributed & event-driven** (FR §4): after something commits in Postgres (`user.enrolled`, `course.published`, `lesson.completed`), **publish facts to a log** so *many* subscribers can react without the API knowing them all. Handles **backpressure** and **spikes** (buffer), supports **Schema Registry** for contract evolution. |
+| **Task execution** | **Celery** | **Side-effect jobs** (FR §3 notifications, FR §4 analytics updates): “send email,” “increment aggregate,” “warm cache.” RabbitMQ is the **broker** Celery uses. Often a **consumer** reads Kafka → **enqueues** Celery tasks (Kafka is not a replacement for a task queue here). |
+
+**One plausible end-to-end flow (aligned with PRD, not all built yet):**
+
+1. **Publish course:** FastAPI `POST .../publish` → **Temporal** starts `CoursePublishingWorkflow` (202). Worker runs activities (DB reads/writes). On success, emit **`course.published`** to **Kafka** (or transactional outbox → publisher).
+2. **Student enrolls:** API commits enrollment → **transactional outbox** row or **`user.enrolled`** to Kafka.
+3. **Downstream:** Kafka consumers (or a bridge) trigger **Celery** tasks: welcome email, analytics rollup, cache invalidation — **independently**, **retriable**, **idempotent**.
+
+So: **Temporal** owns **long-running orchestration + compensation** for publishing; **Kafka** owns **durable event stream + fan-out**; **Celery** owns **discrete async work**. They compose; they do not replace each other.
+
+```mermaid
+flowchart LR
+  subgraph api [FastAPI]
+    R[Routes]
+  end
+  subgraph temporal [Temporal]
+    TW[Temporal worker]
+    WF[Publish workflow]
+  end
+  subgraph kafka [Kafka]
+    T[Topics]
+  end
+  subgraph celery [Celery]
+    CW[Celery workers]
+  end
+  R -->|"start workflow"| TW
+  TW --> WF
+  WF -->|"emit events"| T
+  R -->|"outbox or emit"| T
+  T -->|"consume"| CW
+```
+
+---
+
+**A — Saga pattern (what it is, and how we use it):**
+
+A **Saga** is a pattern for **a business operation that spans multiple steps** (often multiple services or multiple DB writes) **without** a single distributed two-phase commit (2PC). Instead of one giant atomic transaction, you use a **sequence of local transactions**, each with a **compensating action** if a later step fails.
+
+**Two styles:**
+
+| Style | Who coordinates | Notes |
+|-------|-----------------|-------|
+| **Choreography** | Each service listens and decides what to do next | Loose coupling; global flow is harder to see; ordering can get messy. |
+| **Orchestration** | One **orchestrator** drives steps in order | Clear flow, explicit failure handling; here the orchestrator is a **Temporal workflow**. |
+
+**Compensating transaction:** not always a literal `DELETE` — whatever **semantically undoes** the forward step (e.g. revert course to `draft`, delete processed artifacts). Compensations run **in reverse order** of completed steps.
+
+**Example for our publish saga (orchestrated in Temporal):**
+
+1. **Step A (read-only validate):** course exists, draft, owner, has content. *No compensation.*
+2. **Step B (process):** write processed markers / placeholder pipeline. *Compensation:* delete that processed data.
+3. **Step C (publish):** set `status = published`. *Compensation:* revert to `draft`.
+
+If **C** fails after **B** succeeded → run **B’s compensation**, then surface failure. If **B** fails → nothing to compensate from **A**. Temporal **retries activities**; activities must be **idempotent** (deterministic keys → same effect) because retries happen.
+
+**Saga vs “just use Kafka”:** Kafka delivers **events**; it does not by itself remember “we were on step 2 of 3 and must compensate.” You still need **orchestration logic** somewhere — handwritten state machines + DB, or **Temporal** with persisted workflow history and replay.
+
+**Saga vs Celery chain:** A Celery chain can order tasks, but **durable saga state**, **replay-safe workflow code**, and **first-class compensation** after exhausted retries are weaker without building a lot yourself; Temporal is the deliberate choice for **publishing** in this project.
+
+**PRD pointers:** publishing + partial failure → [PRD.md](PRD.md) §2; events + analytics + notifications → §3–4 and **NFR-C05**; Temporal playbook → [CLAUDE.md](../CLAUDE.md) Saga / Temporal section.
+
+---
+
+### Q: Which comes on top or first — Kafka, Celery, or Temporal?
+
+**A:** There is **no single global stack** with one always “on top.” **Order is per user action** (per use-case). Almost always:
+
+1. **First:** **FastAPI + PostgreSQL** — auth, validation, commit (the synchronous request). The user’s durable state is decided here for enroll (and for “start publish,” only “workflow started” + 202, not “course is published” yet).
+
+2. **Then (async):** depends on the flow:
+
+| Use-case | First async | Then typical chain |
+|----------|-------------|---------------------|
+| **Publish course** | **Temporal** (`start_workflow` from API) | Temporal **activities** (DB). On success → **Kafka** `course.published` → consumers may call **Celery** (email, index, metrics). |
+| **Enroll** | **Kafka** `user.enrolled` (after commit; often via outbox) | Consumer → **Celery** (welcome email, analytics). **Temporal not required** for vanilla enroll. |
+
+**Memory aid:** **API+DB first** always for the HTTP request. Among async tools: **Temporal leads** when you need a **multi-step saga with compensations** (publish). **Kafka leads** when you need to **broadcast a fact** to many subscribers. **Celery** often **follows Kafka** (or runs on a schedule) to **execute** a concrete task.
+
+**“Top” in architecture diagrams:** the **client** and **API** are “top” (entry). Temporal / Kafka / Celery are **peers below** the API, wired differently per flow — not a vertical ranking of superiority.
+
+---
+
+### Q: Are we good to go ahead with Part B?
+
+**A:** **Not as the next committed delivery track**, if we follow the official Part A → Part B plan. **Part A = Weeks 1–3** (foundation, enrollment + publishing workflow, events + observability). **Part B = Weeks 4–5** (GenAI) and explicitly builds on Part A (e.g. chunking pipeline, events like `lesson.created`).
+
+**Current state (typical repo trajectory):** Week 1 ✅; Week 2 Chunk A (enrollment) ✅; Week 2 Chunk B (Temporal publishing) ✅; Week 3 (Kafka, Celery, analytics, observability) ⬜. Starting Part B **before** those leaves gaps: weaker event bus for lesson lifecycle, observability for RAG latency work.
+
+**When you *are* good for Part B:** after Part A scope is done **or** your mentor agrees to a **reordered plan** (document the tradeoff: you accept missing integration until Week 3 catches up).
+
+**Parallel spikes:** OK for learning (local notebooks, small embedding demos); not a substitute for finishing Part A for the graded / integrated system.
+
+---
+
+### Q: Are we good to go ahead with Week 2 Chunk B (Temporal publishing)?
+
+**A:** **Yes.** Chunk A (enrollment) is complete; the planned next step in Part A Week 2 is **Chunk B**: Temporal SDK, worker, publishing workflow with compensations, `POST /courses/{id}/publish` returning **202** + workflow id, tests via `temporalio.testing.WorkflowEnvironment`. Prerequisites: course/module/lesson models, draft/published semantics, [CLAUDE.md](../CLAUDE.md) Saga section, `docker-compose --profile week2` for Temporal + UI.
+
+---
+
+### Session: 2026-05-13 — Temporal first-time: sessions, factories, queues vs RabbitMQ
+
+### Q: Why does `app/temporal/activities/course_publish.py` use its own session scope instead of FastAPI `get_db`?
+
+**A:** **`get_db` is request-scoped** — FastAPI opens a session for one HTTP handler and closes it after the response. **Temporal activities never go through FastAPI**; they run on the **worker** when Temporal invokes them. So activities need an explicit **open session → work → commit/rollback** path. `_session_scope()` mirrors the same **try / commit / except rollback** pattern as `get_db`, but callable from activity code without `Depends()`.
+
+### Q: What is a session factory here?
+
+**A:** **`async_sessionmaker`** (e.g. `AsyncSessionLocal`) is the factory: each call `AsyncSessionLocal()` creates a **new** `AsyncSession` using the shared engine pool. In `course_publish.py`, `configure_activity_session_factory` lets **tests** point activities at the **test DB** sessionmaker; in production the worker leaves it unset and uses `app.database.AsyncSessionLocal`.
+
+### Q: What is an async context manager?
+
+**A:** An object (or `@asynccontextmanager` function) usable with **`async with`**: setup runs on enter, cleanup on exit (including on exceptions). `_session_scope()` yields a session then commits or rolls back — same idea as `get_db`’s `yield` + commit/rollback.
+
+### Q: What are Temporal’s main pieces and how does a run work?
+
+**A:** **Server** — durable **workflow history** (not your app Postgres). **Client** (API) — `start_workflow` / describe / query. **Worker** — long-lived process polling a **task queue**, executing **workflow** code (orchestration, deterministic) and **activity** code (DB/HTTP side effects, retried). **Task queue** — a name both starter and worker agree on (e.g. `course-publishing`). Server schedules tasks; workers pull; you scale by **more workers** on the same queue.
+
+### Q: RabbitMQ has queues too — why both Temporal and RabbitMQ?
+
+**A:** **RabbitMQ** (with Celery) is ideal for **many independent tasks** and simple fire-and-forget work. **Temporal** is for **multi-step, stateful orchestration** with built-in history, replay, per-activity retries, and saga-style ordering. This project uses Temporal for **course publish** and plans RabbitMQ/Celery for other async work — they complement; neither fully replaces the other.
+
+### Q: Do API, worker, and Temporal run on the same server?
+
+**A:** **Locally**, often one machine with **separate processes** (uvicorn, worker, Temporal, Postgres). **In production**, they are usually **different** deployable units that only need network access to each other. App Postgres and Temporal’s own storage are **different** concerns.
+
+### Q: Do we need a separate `temporal_worker.py` per workflow or per queue?
+
+**A:** **No.** One worker process typically registers **multiple** workflows and activities on **one or more** task queues. You add another worker binary or queue only for **isolation or scaling policies**, not because Temporal requires one file per workflow.
+
+---
+
+### Q: Interview-style — RabbitMQ vs Kafka vs Celery vs Temporal; are they the same?
+
+**A:** **No** — different layers and purposes:
+
+| Piece | Role |
+|-------|------|
+| **RabbitMQ** | **Message broker** — queues/routing; typical **Celery broker** for task messages. |
+| **Kafka** | **Distributed log / event stream** (topics, partitions) — durable **facts** many consumers can read; **replay** by offset; not “one consumer deletes for everyone” like a simple work queue. |
+| **Celery** | **Task framework** — workers execute **discrete tasks** pulled from a broker (RabbitMQ, Redis, …). |
+| **Temporal** | **Workflow platform** — **server** stores **workflow history**; **workers** run **workflows** (orchestration) and **activities** (side effects, retried). Task **queues** route work; the product is **stateful orchestration**, not just a queue. |
+
+**Composition:** Celery often uses **RabbitMQ**. **Kafka** can feed work into Celery (consumer → enqueue task). **Temporal** can coexist with both (e.g. publish saga in Temporal; analytics/email via Kafka → Celery). They **complement**; they do not replace each other for every use case.
+
+### Q: Is “two Celery workers” like extra Gunicorn workers?
+
+**A:** **No.** **Gunicorn/Uvicorn workers** handle **HTTP** for the API. **Celery workers** pull **background tasks** from the **broker**. More Celery processes = more **async job** capacity, not more web request workers. One host can run both, as separate process pools.
+
+---
+
+### Q: What is a message broker? Fan-out? Kafka vs RabbitMQ with real-life examples? Is Redis a queue?
+
+**A:**
+
+**Message broker** — middleware between **producers** and **consumers**: accepts messages, buffers/routes them, delivers so senders don’t depend on receivers being up.
+
+**Fan-out** — **one** message/event is **distributed to many independent consumers** (each does its own work). Example: “flight cancelled” → push notification service, email service, analytics, and partner API all react.
+
+**Kafka** — append-only **event log** (**topics**). Producers **append** records; **consumer groups** each track an **offset** (read position). Many groups on the same topic ≈ **fan-out** of the same stream. Good for **facts** (`user.enrolled`) and **replay**. Consumers **react** (update DB, enqueue Celery, metrics).
+
+**RabbitMQ** — **brokered queues** (often **one consumer** takes a message, **acks**, message leaves queue). Good for **jobs** (“send email”, “generate PDF”). **Celery** commonly uses RabbitMQ (or Redis) as the **broker**; Celery **workers** **act on** those task messages.
+
+**Real-life analogy:** RabbitMQ ≈ **order ticket** on a kitchen rail (**next cook** grabs **one** job). Kafka ≈ **bank ledger line** everyone can **read**; teams keep their own **bookmark**; new analytics can **re-read** history.
+
+**Redis** — in-memory **data store**; not “only a queue.” It **can** implement queues (**Lists**, **Streams**) or be a **Celery broker**, but it is not the same product category as RabbitMQ/Kafka alone.
+
+---
+
+### Q: Does Celery put messages into a RabbitMQ queue?
+
+**A:** **Yes**, when RabbitMQ is configured as the **Celery broker**. `task.delay()` / `apply_async()` publishes a **serialized task message** to RabbitMQ (via Celery’s exchange/routing); **workers** consume from the queue, execute the task, and **ack**. With a **Redis** broker, the payload goes to Redis instead—same pattern, different transport.
+
+---
+
+### Q: Is Celery the worker that attaches to RabbitMQ? Does Kafka have no workers for events?
+
+**A:**
+
+**Celery** is a **framework**, not one process. Your **API** (or any code) uses Celery as a **client** to **publish** task messages to the **broker** (e.g. RabbitMQ). **Celery worker** processes are **separate** long-running processes (`celery -A app worker`) that **connect to that broker**, **consume** queue messages, and run `@task` functions. So: **RabbitMQ** stores the queue; **Celery workers** attach and pull work.
+
+**Kafka** does not include Celery. Events live in **topics**. **Consumer applications** (your services using a Kafka client, or stream processors) **subscribe / poll**, process each record, and **commit offsets**. Those consumers are **worker-like** but are **your** processes—not “Celery” unless you explicitly wire Kafka consumption into Celery tasks.
+
+---
+
+### Q: Who adds events to Kafka? Does Kafka have its own system?
+
+**A:** **Producers** add events — application code (or Kafka Connect, stream jobs, test CLIs) using a **Kafka producer client** that **appends records to topics**. Kafka does not infer business rules by itself; it **stores, replicates, and serves** the log your producers write.
+
+**Kafka is its own distributed system:** broker processes, topic partitions, replication, retention, consumer groups and offsets, and cluster metadata (ZooKeeper or **KRaft**). You operate or buy that infrastructure; your services are **clients** that produce and consume.
+
+---
+
+## Session 4 — 2026-05-14
+
+### Q: How should the frontend manage roles — server session or something else?
+
+**A:** Mirror the backend, which is **stateless JWT — there is no server session**. So the frontend is also sessionless:
+
+- **Login** posts the OAuth2 password form to `/auth/login` and gets a JWT back. Store it in `localStorage` (`smartcourse_token`). An axios request interceptor attaches `Authorization: Bearer <token>` on every call.
+- **Role is not decoded from the token on the client.** Right after login (and on every app load with a stored token), `AuthContext` calls `/users/me` and keeps the returned `User` — including `role` — in React state. Role-dependent UI (nav links, route guards) is driven by that record.
+- **The client is never the authority.** Route guards (`ProtectedRoute`) are a UX convenience; the backend re-checks role and ownership on every request regardless. A tampered token fails server-side, and an axios response interceptor clears it on any `401`, bouncing the user to `/login`.
+
+Why not a server session? It would mean adding session storage (Redis), a session cookie, CSRF protection, and a logout endpoint — state the system deliberately avoided. JWT keeps the API horizontally scalable (any worker can validate a request with no shared session store). Why not trust a client-decoded JWT for role? Because the client can't verify the signature meaningfully and the token can go stale (e.g. a deactivated account) — `/users/me` is the single source of truth, and it's one cheap call.
+
+### Q: Why did adding a frontend require new backend endpoints?
+
+**A:** Three read endpoints were added — `GET /courses/mine`, `GET /courses/{id}/modules/{mid}/lessons`, `GET /enrollments/{eid}/progress`. None are new *features*: they expose data the system already owns but had no read path for. The original API was write-biased (you could `POST` a lesson but not `GET` the list), which is fine for curl-driven testing but leaves a UI unable to render. The alternative — having the frontend cache created IDs in `localStorage` — would have put source-of-truth state in the browser, which violates "PostgreSQL is the source of truth." Exposing existing data through the proper Router → Service → Repository layering was the smaller, more correct change.
+
+### Q: Final storage architecture (resolved) — where do chunks, embeddings, and analytics actually live?
+
+**A:** This consolidates and supersedes the earlier, drifting answers above. The driving constraint: **Part A explicitly mandates a NoSQL DB** (PRD.md:211), so MongoDB needs a job it *genuinely* fits — not a forced one.
+
+**Embeddings → PostgreSQL + pgvector.** Embeddings exist to be similarity-searched (ANN). pgvector is purpose-built — HNSW indexes, cosine distance, free, inside the Postgres we already run. Mongo's `$vectorSearch` is Atlas-first and weaker self-hosted. The embedding is FK'd to a chunk FK'd to a lesson, so one JOIN yields "the vector + the lesson/module/course context" — the whole RAG retrieval query.
+
+**Chunks → PostgreSQL, same row as the embedding.** A chunk and its embedding are one row: `{ lesson_id, course_id, chunk_index, text, embedding }`. "Chunks in Mongo" only made sense while embeddings were *also* going to Mongo; once embeddings move to pgvector, splitting chunk-text-in-Mongo from embedding-in-Postgres would force a cross-database join on every retrieval. Chunks are not "unstructured" — fixed fields, FK to lesson, queried as "all chunks for lesson X in order." The earlier "chunks are unstructured text" justification (QA.md, *Where does content get stored…*) was the weak link.
+
+**Analytics — the 9 dashboard metrics → PostgreSQL SQL.** Total students, completion rate, popular courses, etc. are counts/averages/group-bys/JOINs over tables we already have. A materialized view handles that well past 50k users. No document store needed to *compute* them.
+
+**MongoDB → the raw interaction/event log.** Not the 9 metrics — the granular behavioral stream *underneath* them: `lesson.viewed`, `video.paused@03:12`, `search.performed(...)`, `quiz.answered`. PART_A names this exact problem in its own words — *"rich but underutilized data"* (PART_A.md:13), *"not leveraged for recommendations"* (PRD.md:17). It is a genuine document-store fit:
+- high write volume, append-only — every interaction, never updated
+- schema varies per event type — a `payload` document beats 20 nullable SQL columns
+- not the source of truth (Postgres is) — losing one event doesn't corrupt user state; it is the async category
+- no transactional JOINs with the core — it is a sink: Kafka/Celery write into it, batch jobs roll it up
+
+| Store | Holds | Why |
+|---|---|---|
+| PostgreSQL | users, courses, modules, lessons, enrollments, progress, certificates **+ chunks + embeddings (pgvector)** | source of truth; relational; ACID; ANN search co-located with the data it describes |
+| MongoDB | one `events` collection — raw interaction/event log | high-volume, append-only, per-event-type flexible schema; the "underutilized data" PART_A calls out |
+| Postgres aggregates | the 9 dashboard metrics | SQL rollups over core tables + the event log |
+
+**Consequences:** overrides the earlier "MongoDB = lesson_chunks / no chunks in Postgres ever" decision. pgvector requires swapping the Docker image to `pgvector/pgvector:pg15` — a one-line Week 4 change. The `text` lesson question (lessons needing a `content_text` column instead of a fake URL) is still open and orthogonal to this.
+
+### Q: How long does a Temporal workflow normally take, and where do we watch it?
+
+**A:** **Temporal UI → http://localhost:8080** (the `temporal-ui` container). Find a run by Workflow ID `publish-<course_id>`; the Event History shows each `ActivityTaskScheduled/Started/Completed` and the final status.
+
+For our `CoursePublishingWorkflow` the normal happy path is **sub-second — roughly 100–500ms locally.** It is 3 sequential activities, all trivial DB work (a SELECT + COUNT, then SELECT + UPDATE, then SELECT + UPDATE). The visible time is mostly Temporal's orchestration overhead: each `execute_activity` is a round trip — workflow → server → task queue → worker long-poll → execute → report back → workflow resumes — ~10–50ms per hop locally.
+
+The per-activity `start_to_close_timeout` (120s in our code) is a **ceiling, not the expected duration** — a healthy run never approaches it.
+
+What stretches a run (and is usually not "slowness"):
+- **Worker not running** — the workflow starts, activity tasks queue on `course-publishing`, nothing consumes them. With no `schedule_to_start` timeout set, it stays **Running indefinitely**. A stuck-on-Running workflow almost always means the worker process is down.
+- **Transient (retryable) failure** — our real validation errors raise `ApplicationError(non_retryable=True)` and fail instantly. But a generic exception (e.g. DB briefly unreachable) hits Temporal's default retry policy: exponential backoff 1s -> 2s -> 4s -> 8s..., unlimited attempts — which can extend a run to minutes.
+
+Future caveat: once `process_lessons_activity` becomes the real Week 4 chunking + embedding pipeline, *that* activity legitimately becomes the long pole (seconds to minutes), and it should get its own tuned timeout + retry policy.
+
+### Q: Should the Temporal worker have its own Dockerfile, or share one with the API?
+
+**A:** **One Dockerfile, one image, two `command:`s.** The worker is not a separate application — it is the same `app` package, the same `requirements.txt`, the same `.env`, the same models/config/db code. The only difference is the entrypoint: the API runs `uvicorn app.main:app`, the worker runs `python -m app.workers.temporal_worker`. docker-compose builds the image once and runs it in three roles — `migrate`, `api`, `worker` — by overriding `command:`.
+
+Why one image, not two:
+- **Version lock.** API and worker provably run identical code. Two Dockerfiles invite drift — the worker built from a stale commit while the API moved on. For Temporal that is not cosmetic: workflow code that differs between the run that started and the worker that replays it causes **non-determinism / replay failures**, the failure class Temporal punishes hardest.
+- **Build once.** One build context; each service just overrides `command:`. Simpler CI, smaller footprint.
+- **Scales trivially.** `docker compose up --scale worker=3` off the same image — workers are stateless.
+
+The single build anchor is the `migrate` service: it is the common `depends_on` of both `api` and `worker`, so building it once produces the shared `smart-course-app` image and avoids a parallel-build race on the image tag (`api`/`worker` carry only `image:`, no `build:`).
+
+When you *would* split — and it is not now: once `process_lessons_activity` becomes the real Week 4 chunking + embedding pipeline, it pulls in heavy deps (torch / sentence-transformers / pypdf / faster-whisper, hundreds of MB) the API never needs. Even then the answer is not two Dockerfiles — it is **one multi-stage Dockerfile with `api` and `worker` build targets** sharing a base. Pre-building that today is YAGNI.
+
+Operational note: `temporalio/auto-setup`'s `tctl cluster health` healthcheck reports the *frontend* ready, but the *matching* service can still be a few seconds behind — so a freshly-started worker logs `"Not enough hosts to serve the request"` for ~10–15s. The Temporal SDK auto-retries and the container has `restart: unless-stopped`; it self-heals without intervention. That retry-and-recover behaviour is the correct design, not a bug to paper over.

@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 async def _run() -> None:
-    logging.basicConfig(level=logging.INFO)
+    from app.observability.logging import configure_json_logging
+    from app.observability.tracing import configure_tracing, instrument_sqlalchemy
+    from app.database import engine
+    configure_json_logging(service_name="temporal-worker")
+    configure_tracing(service_name="temporal-worker")
+    instrument_sqlalchemy(engine)
     cap.configure_activity_session_factory(AsyncSessionLocal)
     client = await Client.connect(settings.temporal_host, namespace="default")
     worker = Worker(
@@ -26,6 +31,7 @@ async def _run() -> None:
             cap.validate_course_activity,
             cap.process_lessons_activity,
             cap.mark_published_activity,
+            cap.emit_course_published_activity,
             cap.delete_processed_data_activity,
             cap.revert_to_draft_activity,
         ],

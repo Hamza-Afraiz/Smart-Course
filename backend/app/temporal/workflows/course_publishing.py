@@ -43,3 +43,14 @@ class CoursePublishingWorkflow:
                     start_to_close_timeout=timedelta(seconds=120),
                 )
             raise
+
+        # Step 4: announce. Outside the saga's try/except — the course IS
+        # already published; if this Kafka publish fails permanently, the
+        # workflow ends in failed state but the DB stays consistent (course
+        # status = published; no rollback runs). Temporal retries transient
+        # failures automatically; consumer-side dedupe absorbs duplicates.
+        await workflow.execute_activity(
+            "emit_course_published_activity",
+            args=[course_id, run_id],
+            start_to_close_timeout=timedelta(seconds=30),
+        )

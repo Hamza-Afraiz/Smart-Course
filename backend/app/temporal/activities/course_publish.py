@@ -6,18 +6,21 @@ Tests may override the session factory via configure_activity_session_factory().
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+from aiokafka import AIOKafkaProducer
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from app.config import settings
 from app.models.course import Course, CourseStatus
 from app.models.lesson import Lesson
 from app.models.module import Module
@@ -123,6 +126,50 @@ async def mark_published_activity(course_id: str, idempotency_key: str) -> None:
             )
         course.status = CourseStatus.published
         await session.flush()
+
+
+@activity.defn
+async def emit_course_published_activity(course_id: str, run_id: str) -> None:
+    """Announce `course.published` by publishing directly to Kafka.
+
+    This is one of the two places we bypass the outbox table — Temporal's
+    workflow history is the durability layer here. If this activity fails,
+    Temporal retries it with the same idempotency_key; if it succeeds twice
+    (rare network edge), consumer-side dedupe on `event_key` absorbs it.
+
+    Per the architecture rule in docs/QA.md:
+      - event from a normal DB transaction → outbox-then-relay
+      - event from inside a Temporal workflow → activity-direct-to-Kafka
+    """
+    idempotency_key = f"publish-{course_id}-{run_id}"
+    payload = json.dumps(
+        {
+            "course_id": course_id,
+            "workflow_run_id": run_id,
+            "published_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ).encode()
+
+    producer = AIOKafkaProducer(
+        bootstrap_servers=settings.kafka_bootstrap_servers,
+        acks="all",
+        enable_idempotence=True,
+        client_id="temporal-course-publish",
+    )
+    await producer.start()
+    try:
+        await producer.send_and_wait(
+            topic="events.course.published",
+            key=idempotency_key.encode(),
+            value=payload,
+            headers=[
+                ("idempotency_key", idempotency_key.encode()),
+                ("event_type", b"course.published"),
+                ("source", b"temporal-workflow"),
+            ],
+        )
+    finally:
+        await producer.stop()
 
 
 @activity.defn

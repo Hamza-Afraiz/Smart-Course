@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # ── Kafka (Week 3) ────────────────────────────────────────────────────────
     kafka_bootstrap_servers: str = "localhost:9094"
 
+    # ── MongoDB (Week 3 — raw event log) ──────────────────────────────────────
+    mongo_url: str = "mongodb://localhost:27017"
+    mongo_db: str = "smartcourse"
+
+    # ── Tracing (Week 3 — OpenTelemetry → Jaeger) ─────────────────────────────
+    # empty string = tracing disabled (e.g. running tests or host dev without Jaeger)
+    otel_exporter_otlp_endpoint: str = ""
+
     @property
     def is_development(self) -> bool:
         return self.app_env == "development"

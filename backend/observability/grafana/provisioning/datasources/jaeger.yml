@@ -1,0 +1,10 @@
+apiVersion: 1
+
+datasources:
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    access: proxy
+    # Grafana queries Jaeger's query API (the all-in-one serves it on 16686)
+    url: http://jaeger:16686
+    editable: true

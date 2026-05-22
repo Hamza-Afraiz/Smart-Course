@@ -1887,3 +1887,815 @@ The single build anchor is the `migrate` service: it is the common `depends_on` 
 When you *would* split — and it is not now: once `process_lessons_activity` becomes the real Week 4 chunking + embedding pipeline, it pulls in heavy deps (torch / sentence-transformers / pypdf / faster-whisper, hundreds of MB) the API never needs. Even then the answer is not two Dockerfiles — it is **one multi-stage Dockerfile with `api` and `worker` build targets** sharing a base. Pre-building that today is YAGNI.
 
 Operational note: `temporalio/auto-setup`'s `tctl cluster health` healthcheck reports the *frontend* ready, but the *matching* service can still be a few seconds behind — so a freshly-started worker logs `"Not enough hosts to serve the request"` for ~10–15s. The Temporal SDK auto-retries and the container has `restart: unless-stopped`; it self-heals without intervention. That retry-and-recover behaviour is the correct design, not a bug to paper over.
+
+### Q: We add an outbox to avoid losing events to Kafka — but couldn't the outbox row also fail to land? Aren't we just moving the same problem?
+
+**A:** No, and the difference is one word: **transaction**. The outbox row is an `INSERT` into the *same Postgres* as the business write, *inside the same transaction*:
+
+```sql
+BEGIN;
+  INSERT INTO enrollments(...)  → row 999;
+  INSERT INTO outbox(...)       → event row keyed enrollment-999;
+COMMIT;
+```
+
+Those two `INSERT`s are one atomic write. Postgres's ACID guarantee means they *both* land on disk or *neither* does — Postgres's WAL backs this even through a power cut. There is no failure mode where the enrollment commits but the outbox row vanishes; they share a single commit.
+
+The Kafka dual-write problem looks different:
+
+```
+COMMIT enrollment in Postgres ✓
+... gap ...
+send event to Kafka       ← different system, different network, different ack
+```
+
+Two writes to two systems, two ack points, an unavoidable gap. *That* gap is where events get lost (process crash, network drop, broker down). No ordering of the two writes is safe.
+
+The outbox collapses "DB write + emit event" into "DB write only" at commit time — the event becomes part of the same atomic write the user is already doing.
+
+**"But the relay still talks to Kafka — same problem there?"** No: the outbox row is already durably committed in Postgres before the relay tries anything. If the relay crashes mid-send, the row sits there with `sent_at = NULL` and is retried on restart. If Kafka is down for an hour, outbox rows queue up and drain when it returns. **The event cannot be lost** — the worst case is delay, or a *duplicate* on Kafka (relay retried after a dropped ack), which is exactly what consumer-side idempotency keys + dedupe handle.
+
+The layering:
+
+| Concern | Solved by |
+|---|---|
+| Event might never be emitted (lost) | **Outbox** — atomic with the business write |
+| Event might be emitted twice (duplicate) | **Idempotency key + consumer dedupe** |
+| → | **Effectively-once delivery** |
+
+### Q: Walk me through the idempotency-key + dedupe pattern with a real example. What is TTL? What does "dedupes" mean?
+
+**A:** **Dedupe** = "deduplicate" = "skip a message we have already processed." Standard ops shorthand.
+
+Concrete run-through. Alice clicks Enroll on the Python Bootcamp course; her enrollment row gets `id=999`.
+
+```
+1. POST /courses/123/enroll
+2. In ONE Postgres transaction:
+     INSERT INTO enrollments(...)   → id=999
+     INSERT INTO outbox(...)        → { event_type: "user.enrolled",
+                                        event_key:  "enrollment-999",
+                                        payload:    {enrollment_id:999, ...} }
+   COMMIT
+3. Return 201 to Alice
+```
+
+A separate **relay** polls the outbox, finds the row, publishes to Kafka topic `events.user.enrolled` with idempotency key `enrollment-999`. Here's the failure that makes the key necessary:
+
+```
+relay → Kafka:  "message {key: 'enrollment-999', ...}"
+Kafka:          accepted, persisted ✓
+Kafka → relay:  "ack"  ← network drops the ack
+relay:          "no ack — retry"
+relay → Kafka:  same message again
+Kafka:          accepted, persisted ✓ (Kafka does not deduplicate on its own)
+```
+
+Kafka now has **two physical copies** of one business event. Three consumer groups (welcome-email, analytics, recommendations) each read both copies. Without dedupe: 2 welcome emails, 2 analytics rows, numbers diverge from Postgres.
+
+The **idempotency key** ties the two physical Kafka messages back to one real-world event. Both copies carry `enrollment-999` because we computed the key from the row id, not from anything Kafka-specific.
+
+The consumer's loop, before any side effect:
+
+```python
+def on_message(msg):
+    key = msg.headers["idempotency_key"]   # "enrollment-999"
+    if already_processed(key):
+        return                              # duplicate — skip
+    do_the_work(msg)                        # send email / write Mongo / etc.
+    mark_processed(key)
+```
+
+Delivery #1: `already_processed("enrollment-999")` → False → email sent → key recorded. Delivery #2: → True → skip. Alice gets one email.
+
+**Where the "already processed" record lives — two options:**
+
+**Postgres `processed_events` table** (durable, no TTL):
+```sql
+INSERT INTO processed_events (event_key, processed_at)
+VALUES ('enrollment-999', NOW())
+ON CONFLICT (event_key) DO NOTHING;
+-- Rows inserted = 1  → first time, do the work
+-- Rows inserted = 0  → duplicate, skip
+```
+
+**Redis `SET ... NX EX`** (fast, auto-expires):
+```
+SET processed:enrollment-999 1 EX 86400 NX
+```
+- `EX 86400` → **TTL (Time To Live) of 86,400 seconds = 24 hours.** Redis auto-deletes the key after that. TTL is a generic Redis feature — entries can be given an expiry timer.
+- `NX` → only set if it does **N**ot e**X**ist. This makes it dedupe-safe.
+
+First delivery: key doesn't exist → SET returns "OK" → do the work. Second delivery (within 24h): key exists → SET returns nil → skip. Past 24h: key auto-expired; if a redelivery somehow showed up *26 hours later* it'd slip through (extremely rare — Kafka redelivers within seconds, not hours).
+
+| | Postgres `processed_events` | Redis `SET NX EX` |
+|---|---|---|
+| Speed | DB roundtrip per event | Sub-millisecond, in-memory |
+| Durability | Survives anything | Lost if Redis crashes without persistence |
+| Memory | Grows forever (or archive) | TTL auto-cleans |
+| Late-redelivery gap | None | Beyond TTL, slips through (rare) |
+
+Combined with the outbox: outbox → no lost events; idempotency key + dedupe → no double-applies. That's **effectively-once**.
+
+### Q: Why is the suggested order better than the doc's checklist? Show with examples.
+
+**A:** The doc's order is 14 items in some list; it does not tell you what to build first. The suggested order is about **proving the pattern end-to-end on one event before scaling out**. Concrete contrast:
+
+**Doc order — Mon to Fri, hypothetical:**
+
+| Day | Action | What breaks |
+|---|---|---|
+| Mon | Spin up Kafka, write `user.enrolled` producer. Events appear in `kafka-ui`. | Looks fine. |
+| Tue | Add `course.published` + `lesson.completed` producers. | 3 producers, **0 consumers** — no way to tell if payloads are even useful. |
+| Wed | Schema registry + idempotency keys on producers. | Still no consumers. Keys exist but have nothing to dedupe against — untested. |
+| Thu | Finally: Celery worker + Kafka→Celery bridge + welcome-email task. Discover the `user.enrolled` payload **doesn't include `student_email`** — task can't send anything. Edit producer, redeploy, redo schema. Then discover the consumer is receiving duplicates — **dedupe was never implemented**, only keys emitted. Half a day debugging cross-system. | Three things broken at once. |
+| Fri | Half a day left. Analytics not started. Observability nowhere. | 60% done across everything; nothing end-to-end. |
+
+Each layer was built without seeing the next.
+
+**Suggested order — same week:**
+
+| Day | Action | What gets proved |
+|---|---|---|
+| Mon AM | Decide `user.enrolled` payload by walking backwards from the welcome-email task: it needs `student_email`, `course_title`. So those go in the payload (or thin payload + consumer fetches from DB). **Consumer-driven design.** | Payload right the first time. |
+| Mon PM | Outbox table + Alembic migration; `enrollment_service` writes to outbox in same TX; verify outbox row appears on enroll. | Producer half works. |
+| Tue AM | Kafka→Celery bridge consumer, `processed_events` dedupe table, welcome-email Celery task (logs to console). **One event flows all the way through.** | Pattern proven end-to-end in 1.5 days. |
+| Tue PM | Stress-test failure modes: kill Kafka mid-relay (verify retry), inject duplicate (verify dedupe skip), crash consumer mid-process (verify offset behavior). | Pattern is *trusted*. |
+| Wed | Copy for `lesson.completed` (~2h) and `course.published` (~2h, via Temporal activity — no outbox needed there). | Both new events working same day; scaffolding already exists. |
+| Thu | Analytics endpoints — reading actual event data, not placeholders. | No rework. |
+| Fri | Prometheus `/metrics` + structured logs (cheap). OpenTelemetry + Jaeger if time. | Observability instruments code that *exists*. |
+
+**The principle:** debugging one broken thing is hard; debugging three half-broken interlocking things in parallel is hell. Get one full slice working before stamping out the other two.
+
+### Q: What does "TX" mean in the outbox discussion?
+
+**A:** TX = **database transaction** — the ACID-atomic kind. A `BEGIN ... COMMIT` block in Postgres. Everything between those two points is one unit: all statements land together (`COMMIT`) or none of them do (`ROLLBACK`, or a crash).
+
+In our FastAPI setup the TX is implicit — managed by the `get_db()` dependency in `app/database.py`. One HTTP request = one session = one transaction. The handler runs all its work against the same `db` session, and the dependency commits (or rolls back on exception) right before the response is returned.
+
+```
+request → BEGIN → handler stages writes (INSERTs, UPDATEs) → COMMIT → response
+```
+
+Until `COMMIT` runs, the staged writes are invisible to any other transaction in the system. After it runs, they are durable (Postgres WAL backs this through power cuts).
+
+When we say "both INSERTs are in the same TX," we mean: the enrollment row and the outbox row are both staged against the same session, and Postgres applies them with one commit. That's what gives us the "both-or-neither" guarantee that the outbox pattern depends on.
+
+### Q: Is the outbox relay a scheduler (like cron)?
+
+**A:** No — it's a **poller**, not a scheduler. Important distinction.
+
+A scheduler fires at fixed times (every minute, every day at 3am) without knowing whether there is work to do. The relay is a **long-running process in a tight loop**:
+
+```python
+while True:
+    rows = await fetch_unsent(limit=100)
+    if not rows:
+        await asyncio.sleep(0.5)
+        continue
+    for row in rows:
+        await kafka.send(...)
+        await mark_sent(row.id)
+```
+
+| | Scheduler (cron) | Our relay |
+|---|---|---|
+| Fires | At fixed times | Continuously, as fast as the loop |
+| Knows about pending work | No | Yes — `WHERE sent_at IS NULL` |
+| Latency from event to Kafka | Up to the interval | ~10–500 ms |
+| Process model | Short-lived per tick | Long-running |
+
+Closest Node analogy: a **BullMQ worker** — a process whose entire job is to drain a queue. Our "queue" happens to be a Postgres table instead of Redis, but the shape is the same. In our compose stack it will look like the Temporal worker: own service, same `smart-course-app` image, long-running.
+
+At industrial scale you'd skip polling entirely and use Postgres logical replication via Debezium (Postgres *pushes* changes to the relay) — same idea, lower latency, more moving parts. Overkill for SmartCourse.
+
+### Q: Doesn't RabbitMQ serve the same purpose as BullMQ / the outbox relay? What are the other options?
+
+**A:** They're at *different points* in the pipeline. The words "queue" and "worker" get reused, but the roles are distinct.
+
+| Tool | Role in SmartCourse | What it really is |
+|---|---|---|
+| Postgres `outbox` table | First durable hop — events land atomically with the business write | A regular table used as a queue |
+| Relay process | Bridge — drains outbox into Kafka | A long-running Python loop. Not a broker. |
+| Kafka | Fan-out distribution — many consumers read the same event log | Persistent, replayable log |
+| RabbitMQ | Celery task broker — delivers specific work units to specific Celery workers | Traditional message broker |
+| BullMQ (Node) | Mental model for Celery — same shape, Redis-backed task queue | A library, not a broker |
+
+The big split: **Kafka = "dumb broker, smart consumer"** (log stays; multiple consumer groups read independently; replayable). **RabbitMQ = "smart broker, dumb consumer"** (once acked, gone; one consumer per task). We use **both** in the system, for different concerns:
+
+```
+POST /enroll  →  [outbox] → [relay] → [Kafka topic events.user.enrolled]
+                                          │
+                                          ├─► welcome-email consumer → RabbitMQ → Celery worker
+                                          ├─► analytics consumer
+                                          └─► recommendations consumer
+```
+
+The Celery+RabbitMQ pair lives *inside* each consumer's downstream path — it's the "execute the side effect" half. It doesn't replace Kafka, the relay, or the outbox.
+
+"Can I skip the relay and publish to Kafka/RabbitMQ directly from the API?" → No. That's the dual-write problem. The broker on the other side doesn't matter; the relay's purpose is to make event emission atomic with a Postgres write.
+
+**Other options for the relay's role**, increasing in latency-improvement and operational cost:
+
+1. **Polling relay (what we have).** Simple, robust, sub-second latency. Right for SmartCourse-scale.
+2. **Postgres `LISTEN/NOTIFY`.** The outbox INSERT fires `NOTIFY`; the relay is `LISTEN`-ing. Push-driven, sub-100 ms. Downside: `NOTIFY` isn't durable — if no one's listening that instant, the notification is lost. Pragmatic shape is LISTEN + poll as fallback.
+3. **Debezium + Postgres logical replication (CDC).** Production-grade. Postgres streams row changes to a replication slot; Debezium turns the stream into Kafka messages. Zero polling, zero application code in the relay role. Downside: Kafka Connect cluster + Debezium plugin = more moving parts.
+4. **Embed the event inside a workflow engine.** This is what `course.published` already does — emitted from inside a Temporal activity, whose history is the outbox-equivalent. Doesn't generalize to non-workflow flows.
+
+Rule of thumb: **polling < LISTEN/NOTIFY < Debezium**. Polling is correct until you're past a few thousand events/second.
+
+### Q: What's the difference between a cron job and the relay — technically and by usage?
+
+**A:**
+
+| | cron-style scheduler | Our relay (poller) |
+|---|---|---|
+| Process model | Short-lived. Fires, runs, exits. | Long-running. One process, infinite loop. |
+| Triggered by | Wall-clock (every minute, at 3am, etc.) | An internal loop that wakes itself |
+| Knows if there's work | No — runs regardless of inbox state | Yes — reads `WHERE sent_at IS NULL`; sleeps if empty |
+| Time-to-action | Up to the interval (often minutes) | One loop tick (~500 ms in our config) |
+| Failure recovery | Down cron = missed ticks | Restart policy keeps it alive; missed work waits in the outbox |
+| Mental model | Calendar with reminders | A worker that paces itself by demand |
+
+Same event, both approaches:
+
+```
+Cron every 1 minute:                       Relay (sleep 500 ms when idle):
+  10:00:00.000  user enrolls                 10:00:00.000  user enrolls
+  10:00:00.050  outbox row written           10:00:00.050  outbox row written
+  10:01:00.000  cron fires                   10:00:00.250  relay's next tick
+  10:01:00.180  message reaches Kafka        10:00:00.519  message reaches Kafka
+  10:01:00.350  email sent                   10:00:00.700  email sent
+  → ~60 second delay                         → sub-second
+```
+
+**Usage rule of thumb:**
+- *Cron* fits periodic, work-doesn't-arrive-between-ticks jobs: nightly cleanup, daily reports, weekly archives, hourly health checks.
+- *Relay-style poller* fits "work arrives at random times and latency matters": draining queues, syncing state, anything that touches a user's perception of timeliness.
+
+In our project: the outbox relay is a poller; a future "archive sent outbox rows older than 7 days" job would be a cron.
+
+### Q: Is it the right approach to run a dedicated long-running process just for the relay?
+
+**A:** For SmartCourse-scale, yes. The decision rests on three concrete reasons, not on pattern preference:
+
+1. **Failure isolation.** A bug or hang in the relay does not touch the API. Users keep enrolling; the outbox accumulates; the relay restarts and drains. In-process background work in the API would couple their lifecycles — relay misbehavior would drag request latency or crash an HTTP-serving worker. Failure-domain separation is the entire point of multi-process designs.
+2. **Independent scaling.** API throughput is bound by request volume and DB connections; relay throughput is bound by Kafka publish rate. Different bottlenecks. `FOR UPDATE SKIP LOCKED` was chosen specifically so the relay scales horizontally with zero coordination: `docker compose up --scale relay=3` and each instance gets a disjoint batch.
+3. **One persistent Kafka producer.** A long-running process holds a single producer connection for its lifetime — TCP setup, metadata fetch, partition discovery happen once. Inside the API per-request, you would either reconnect each call (wasteful + load on Kafka metadata) or keep a global producer in a "stateless" service (anti-pattern that breaks horizontal scaling). Inside a cron tick, you reconnect every tick.
+
+Fourth, softer reason: it matches the architectural class of the Temporal worker we already run. One more long-running container of an existing shape is operationally free.
+
+**When this approach would be wrong:**
+
+| Situation | Better fit | Why |
+|---|---|---|
+| Tiny app, ~10 events/day | In-process `BackgroundTask` after commit | A container for that volume is overkill |
+| Latency-tolerant batch work | Cron every N minutes | No need for resident process |
+| 100k+ events/sec | Debezium / Postgres logical replication | Polling is the wrong shape at that scale |
+| No ops bandwidth | Bundle into existing worker | Avoid net-new processes |
+
+We're not in any of those bands.
+
+**"But isn't polling wasteful?"** At our scale, no. A `SELECT ... WHERE sent_at IS NULL LIMIT 100` that returns zero rows every 500 ms is essentially free — Postgres handles thousands of those per second per connection, and the partial index ensures it never scans junk. The "wasteful polling" criticism applies to 10k+ events/sec systems, where you'd switch to push-based via `LISTEN/NOTIFY` or CDC. Not us.
+
+**Signals that would make me revisit the choice:**
+1. Outbox accumulating > 10k unsent rows during normal operation → relay is the bottleneck; scale to N replicas first, then CDC.
+2. p95 enroll → email latency > 5 s → switch to `LISTEN/NOTIFY` for push-driven wake-ups (eliminates the 500 ms polling floor).
+3. Operational pushback on container count → bundle into a Celery beat periodic task; accept tighter coupling for fewer processes.
+
+None of those are firing. The dedicated relay holds its weight.
+
+### Q: What does the `3c8f1b4a9d52` in the Alembic migration filename mean?
+
+**A:** It's an **Alembic revision ID** — a 12-character hex string (48 bits), randomly generated by `alembic revision -m "..."`. Think of it as a git commit SHA, but for the schema.
+
+It's a hex string instead of "v1, v2, v3" for three reasons:
+
+1. **No collision across feature branches.** Two devs each generate a migration without coordinating, no `004` conflict on merge.
+2. **No implied total order.** Migration ordering is a linked list, not a sequence — each file declares its `down_revision`. Alembic walks the chain.
+3. **Stable identifier.** Renaming the file or its description doesn't change the ID; the DB's `alembic_version` row keeps pointing to it.
+
+The chain in our project right now:
+
+```
+1ff633244782   initial_schema             down=None
+2a8c1d9e0f1b   add course processed_at    down=1ff633244782
+3c8f1b4a9d52   add outbox table           down=2a8c1d9e0f1b
+4d9a2c5e7b13   add processed_events       down=3c8f1b4a9d52   ← HEAD
+```
+
+The DB tracks the current point with one row:
+
+```sql
+SELECT version_num FROM alembic_version;
+-- 4d9a2c5e7b13
+```
+
+`alembic upgrade head` reads that row, walks the linked list forward, calling each `upgrade()` until it reaches HEAD. `alembic downgrade -1` reverses one step.
+
+### Q: Why do we need Redis when RabbitMQ is already configured for Celery? (broker=RabbitMQ, backend=Redis)
+
+**A:** Celery uses *two* distinct storage concepts that want different access patterns:
+
+| | Broker | Result backend |
+|---|---|---|
+| Stores | Pending tasks (the queue) | Task state & return values (PENDING / STARTED / SUCCESS / FAILURE) |
+| Access pattern | Write once on enqueue, read once on consume, then gone — **queue semantics** | Random lookup by task id — **key-value semantics** |
+| Best fit | **RabbitMQ** — durable queues, acks, fair dispatch, DLX | **Redis** — sub-millisecond GETs by key, TTL on results |
+| Who writes | The producer (`.delay()`) | The Celery worker (state transitions) |
+| Who reads | The Celery worker (pulls tasks) | Callers that want "did this finish?" via `.get()` / `.ready()` |
+
+You **can** use Redis for both, or RabbitMQ for both. People don't, because each is mediocre at the other's job:
+
+- *Redis as broker* — works for small loads, but lacks RabbitMQ's durability semantics (ack timeouts, message TTL, dead-letter exchanges, fair prefetch).
+- *RabbitMQ as result backend* — terrible at "show me task abc-123's status" — that becomes queue-scanning gymnastics. Redis does it in one GET.
+
+In our project:
+- The broker (RabbitMQ) is **fully used** — every `send_welcome_email.delay(...)` puts a task there, and the Celery worker pulls from it.
+- The result backend (Redis) is **barely used today** — we don't call `.get()` anywhere. But Celery insists on initializing the backend client at worker startup (a missing `redis` library is what caused our worker to crash with `ImproperlyConfigured` earlier). And internal Celery features (retry tracking, scheduled-task ETAs, group/chord coordination) do touch it.
+
+Could we drop Redis? Yes, by setting `task_ignore_result=True` and removing the result backend. We don't, because Redis is already in our stack for caching — zero new infra cost — and the day we add a task whose status we want to poll, the backend is already wired.
+
+Shorthand: **RabbitMQ = the inbox of tasks waiting to run. Redis = the filing cabinet of tasks that have run.**
+
+### Q: Does Kafka enqueue tasks into Celery? Does Kafka have that capability? Or does it add to RabbitMQ and then Celery consumes it? What is the "Celery bridge"?
+
+**A:** **No — Kafka does not know about Celery.** Kafka has no concept of tasks, of Celery workers, or of RabbitMQ. The transition from Kafka → Celery happens in *our code*, not by any built-in capability of either system.
+
+The "bridge" is an **informal term** for a process we write — in our case `app/workers/welcome_email_consumer.py`. It is a single Python process that imports both libraries and is the only place in the system where the two worlds touch.
+
+The hop-by-hop reality:
+
+```
+Kafka topic events.user.enrolled       ─ raw bytes; Kafka has no opinion on them
+   │
+   ▼ subscribed by aiokafka
+welcome_email_consumer.py              ─ OUR code, running in its own container
+   │  - reads the Kafka message
+   │  - dedupes via processed_events
+   │  - calls send_welcome_email.delay(enrollment_id)   ← THE BRIDGE CALL
+   │
+   ▼ .delay() is Celery's client API. Internally it publishes an AMQP message
+RabbitMQ queue "celery"                ─ Kafka has already forgotten the event
+   │
+   ▼ long-polled by `celery worker`
+celery-worker container                ─ runs the task function, logs, acks
+```
+
+The "bridge call" is one line — `send_welcome_email.delay(enrollment_id)` in [welcome_email_consumer.py](../app/workers/welcome_email_consumer.py). Celery's library, behind that call, connects to its broker URL (RabbitMQ in our config) and publishes a task message. The Kafka library and the Celery library don't know about each other; they just happen to be imported in the same process.
+
+**Why this design and not "Celery consumes Kafka directly"?**
+
+| Layer | Optimized for | Tool we use |
+|---|---|---|
+| Event distribution to multiple consumers | Replayable log, fan-out, ordered partitions | **Kafka** |
+| Per-consumer decision to hand off work | Queue semantics, acks, retries, DLX | **RabbitMQ** (Celery's broker) |
+| Task execution | Concurrency, time limits, retry policy | **Celery workers** |
+
+Celery is a *queue-based* task framework — its worker model assumes a broker with queue semantics (one consumer pulls, acks, message gone). RabbitMQ and Redis fit. Kafka is *log-based* (many consumer groups read the same message independently; replayable history). Third-party `celery-kafka` libraries exist but force queue semantics onto a log — awkward.
+
+So we keep them separated: Kafka does event distribution, RabbitMQ does task queueing, Celery does task execution. The small Python "bridge" we wrote is the seam between *event distribution* and *task execution*.
+
+If we add a second Kafka consumer later (e.g. an analytics consumer writing to Mongo), it'll be another bridge — and it doesn't have to use Celery at all. Each consumer-group reads the same Kafka topic independently; what they do next is their choice.
+
+### Q: What is the difference between a Celery worker and a Celery broker? RabbitMQ is also called a broker — are they the same thing?
+
+**A:** The word "broker" is used at two levels and that's where the confusion comes from.
+
+**RabbitMQ** = the actual message-broker software running as a container in our stack. It stores messages and delivers them to subscribers. Speaks AMQP. Knows nothing about Python, tasks, or Celery.
+
+**"Celery's broker"** = a Celery *config setting* (`broker=settings.celery_broker_url`) that points at an external broker — in our case, RabbitMQ. Celery doesn't ship its own message storage; it always uses an external one (RabbitMQ, Redis, SQS, etc.). "Celery broker" is shorthand for "the broker Celery is configured to use." It is **not a separate service**.
+
+**Celery worker** = a Python process running `celery worker`. It connects to the broker, pulls task messages, executes them by calling the Python function the task name maps to. In our stack it's the `celery-worker` container.
+
+Mail-room analogy:
+- RabbitMQ = **the mailroom** (accepts envelopes, shelves them on labeled racks — the queues).
+- Celery worker = **the person** at a desk, walking to the mailroom, picking up envelopes addressed to them, doing the work.
+- `.delay()` = **dropping an envelope into the mailroom** (the producer side).
+
+Container-level mapping in our system:
+
+| Service in docker-compose | Role |
+|---|---|
+| `rabbitmq` | The actual broker — software service, no Python code |
+| `welcome-email-consumer` | Producer of tasks (Kafka consumer that calls `.delay()` after dedupe) |
+| `celery-worker` | Celery worker (consumer of the RabbitMQ queue) |
+
+Cheat sheet:
+- **RabbitMQ** = message-broker software (a container we run).
+- **Broker (generic)** = any system that holds messages between producers and consumers — RabbitMQ, Redis, Kafka, SQS.
+- **Celery's broker** = config pointing Celery at one of those. In our case → RabbitMQ.
+- **Celery worker** = separate Python process pulling tasks from the broker and executing them.
+
+### Q: What is the AMQP protocol?
+
+**A:** AMQP = **Advanced Message Queuing Protocol**. It is a *wire protocol* — a specification for how messages flow over TCP between producers, brokers, and consumers. It is **not software**; it is a contract.
+
+Cleanest analogy: **AMQP is to RabbitMQ what HTTP is to nginx.**
+
+| Layer | Web stack | Messaging stack |
+|---|---|---|
+| Wire protocol | HTTP | **AMQP** |
+| Servers that speak it | nginx, Apache | RabbitMQ, Qpid, ActiveMQ |
+| Clients that speak it | curl, axios | py-amqp, Kombu |
+
+A Python producer using `py-amqp` and a Java consumer using a different AMQP client can talk to the same broker because they agree on the wire format. Standardization is the entire point.
+
+The protocol defines a small set of primitives (AMQP 0-9-1 model, which RabbitMQ implements):
+
+| Concept | Role |
+|---|---|
+| Connection | Persistent TCP socket to the broker |
+| Channel | Lightweight session multiplexed inside one connection |
+| Exchange | The "switchboard." Producers publish here, never directly to queues. Types: `direct`, `topic`, `fanout`, `headers`. |
+| Queue | Message buffer with a name; stores messages until a consumer pulls them |
+| Binding | Rule linking a queue to an exchange with a routing key |
+
+Producer publishes to *exchange* → binding routes by key → message lands in *queue* → consumer pulls from queue. Celery hides all of this; one `.delay()` call performs the whole traversal.
+
+In our system the URL `amqp://guest:guest@rabbitmq:5672/` encodes:
+- `amqp://` — protocol (unencrypted variant; `amqps://` for AMQP-over-TLS)
+- `guest:guest` — credentials
+- `rabbitmq` — DNS name of the broker inside the compose network
+- `:5672` — standard AMQP port (5671 for TLS; 15672 is RabbitMQ's HTTP management UI)
+- trailing `/` — the default vhost (vhost = namespace for partitioning the broker)
+
+Every Celery task message in our system is an AMQP message with:
+- *Body* — JSON of `{"task": "tasks.send_welcome_email", "args": [...]}`
+- *Properties* — content type, encoding, delivery mode, priority, correlation id
+- *Headers* — arbitrary key/value metadata
+
+Live: `open http://localhost:15672` → log in `guest/guest` → Queues → `celery` → Get messages.
+
+**Gotcha:** AMQP 0-9-1 (RabbitMQ's main protocol) and AMQP 1.0 (Apache ActiveMQ, Azure Service Bus) are essentially different protocols sharing the name. We are entirely in 0-9-1 land.
+
+Where each protocol lives in our stack:
+
+| System | Wire protocol | Port |
+|---|---|---|
+| Postgres | Postgres frontend/backend | 5432 |
+| Redis | RESP | 6379 |
+| **RabbitMQ** | **AMQP 0-9-1** | **5672** |
+| Kafka | Kafka binary | 9092 |
+| Temporal | gRPC | 7233 |
+| FastAPI | HTTP/1.1 | 8000 |
+
+### Q: What is gRPC, the wire protocol Temporal uses?
+
+**A:** **gRPC = Google Remote Procedure Call.** It is an RPC framework — meaning the developer calls a server-side function *as if* it were a local function, and the framework handles serialization + transport.
+
+Mental model: **gRPC is to Temporal what HTTP/REST is to a typical Node Express API** — a wire protocol for typed function calls over the network. But the implementation differs sharply from REST.
+
+Four layers stacked on top of each other:
+
+| Layer | What it provides |
+|---|---|
+| Protocol Buffers ("protobuf") | Schema language + compact binary format. ~3–10× smaller than JSON, baked-in schema-evolution rules. |
+| Code generation | One `.proto` file → client + server stubs in Python, Go, Java, TypeScript, Rust… |
+| HTTP/2 transport | Binary framing, one TCP connection holds many concurrent streams, server push, lower latency than HTTP/1.1. |
+| Four streaming patterns | Unary (1↔1), server streaming, client streaming, bidi streaming. |
+
+**Why Temporal specifically chose gRPC:**
+
+1. **Workers long-poll for tasks.** A worker says "give me the next task on `course-publishing`, hold open if there's nothing yet." Server streaming is native to gRPC; clumsy over HTTP/REST.
+2. **Polyglot SDKs.** Temporal ships SDKs for Go, Java, Python, TypeScript, .NET, PHP, Ruby — all generated from one `.proto` schema. Identical API across languages because it's literally the same contract.
+3. **High-frequency, low-payload RPCs.** Activity heartbeats, workflow state queries, task polls — millions per second on a busy cluster. Protobuf + HTTP/2 is much cheaper than JSON + HTTP/1.1 at scale (binary framing, header compression, connection reuse).
+
+In our system gRPC shows up at:
+
+- `Client.connect("localhost:7233", ...)` in `app/main.py` lifespan — opens the gRPC channel
+- `client.start_workflow(...)` in `publish_service.py` — unary gRPC call (StartWorkflowExecution RPC)
+- `worker.run()` in `temporal_worker.py` — streaming gRPC calls (PollWorkflowTaskQueue, PollActivityTaskQueue) that long-poll for work
+- Temporal UI at `http://localhost:8080` — gRPC-calls the same frontend service the SDK uses
+
+The `temporalio` Python SDK hides every byte of gRPC from our code. We write async Python; the SDK turns it into gRPC traffic.
+
+**REST vs gRPC — when each wins:**
+
+| | HTTP/REST | gRPC |
+|---|---|---|
+| Payload | JSON (text) | Protobuf (binary) |
+| Transport | HTTP/1.1 typically | HTTP/2 |
+| Schema | OpenAPI optional, often loose | `.proto` mandatory, strict |
+| Typing | Runtime/convention | Compile-time, generated stubs |
+| Streaming | SSE/WebSocket bolt-ons | Native, 4 patterns |
+| Browser-callable | Yes, directly | Needs gRPC-Web proxy or REST gateway |
+
+Rule: front-of-house (React → FastAPI) → HTTP/REST. Inside the system, between long-lived services with strict typing and streaming needs → gRPC. Hence FastAPI uses HTTP, Temporal uses gRPC.
+
+### Q: How do we know the outbox + Kafka + consumer pipeline actually survives the failures we designed for?
+
+**A:** We ran three stress tests against the live stack and confirmed each failure mode behaves as the design predicted.
+
+**Test 1 — Kafka outage mid-enrollment**
+- `docker-compose stop kafka`
+- Enrolled a student → API returned **HTTP 201**, unchanged user experience
+- Outbox row created with `sent_at = NULL`
+- Relay logs filled with `NodeNotReadyError` / `Unable to connect to node 1` but the process did not crash
+- After Kafka came back (`docker-compose start kafka`), the relay drained the row in milliseconds; the consumer reconnected, claimed via processed_events, enqueued the Celery task, and the welcome-email log fired (~6s end-to-end including the outage)
+- **Verdict:** outbox decouples user-facing work from broker availability. No event was lost; nothing user-visible degraded.
+
+**Test 2 — Duplicate Kafka message injection**
+- Inside the `relay` container (which has `aiokafka` installed), ran a Python one-liner that produced a message with an already-processed `event_key` (`enrollment-35c8ab76-…`) and the matching `idempotency_key` header
+- The consumer received the duplicate at a new offset, ran `processed_events_repo.claim(...)`, the `INSERT ... ON CONFLICT DO NOTHING RETURNING` returned 0 rows → `claim()` returned False → consumer logged `duplicate enrollment-35c8ab76-… (partition=0, offset=4)` and skipped
+- Celery worker received **no new task**; welcome-email log line count stayed unchanged
+- **Verdict:** consumer-side dedupe via the `(consumer, event_key)` PRIMARY KEY catches duplicates whether they come from relay retries, Kafka rebalances, or hostile injection.
+
+**Test 3 — Consumer downtime**
+- `docker-compose stop welcome-email-consumer`
+- Enrolled three students → all returned 201; relay drained all three outbox rows to Kafka (events at offsets 5, 6, 7)
+- Consumer-group lag (`kafka-consumer-groups.sh --describe --group welcome-email`): **3** — current offset 5, log-end offset 8
+- Welcome-email log count during downtime: unchanged
+- `docker-compose start welcome-email-consumer` → consumer rejoined the group at its last committed offset (5), processed messages 5/6/7 in ~5s, advanced to 8
+- Welcome-email log count after restart: +3 (one per Crash Tester)
+- Lag back to 0
+- **Verdict:** Kafka's consumer-group durability means the consumer can be down arbitrarily long without event loss. On restart it resumes exactly where it stopped, processes once each.
+
+Combined, the three tests empirically validate the failure-mode table in the Stage 3 explanation: no event is ever lost, duplicates are absorbed, and every layer can fail independently without the others noticing.
+
+### Q: When emitting `course.published` from a Temporal activity, why did the activity fail with `Unable to bootstrap from [('localhost', 9094, ...)]` even though Kafka was healthy?
+
+**A:** Container-network gotcha. Our `.env` has `KAFKA_BOOTSTRAP_SERVERS=localhost:9094` — the host-mode default, useful when running uvicorn/the worker directly on the host. But inside any compose container, `localhost` is the container itself, not the host machine and not the Kafka container.
+
+The pattern we adopted across the stack: `env_file: .env` brings in the host-mode defaults; `environment:` in each service overrides the URLs with their compose-network names (`postgres`, `redis`, `kafka`, `temporal`). Until we added `course.published` emission, the `worker` service didn't need Kafka — so it never got the override. The activity tried `localhost:9094`, failed, and Temporal kept retrying it forever (which is the correct behaviour — that's why no events were lost; the workflow stayed in "retrying step 4" indefinitely until the env was fixed).
+
+Two takeaways:
+
+1. **Service overrides are per-service.** Adding a new dependency to any single service can require a new `environment:` line — `env_file` defaults aren't always right for in-container life.
+2. **Temporal retried for us.** While the env was broken, the workflow sat at attempt 6, 7, 8… on the failing activity. The moment we restarted the worker with the correct env, the next retry succeeded, the activity completed, the workflow advanced, and the message landed on `events.course.published`. No manual replay, no lost work — exactly the at-least-once behaviour Temporal is sold on.
+
+Fix recorded in `docker-compose.yml`:
+```yaml
+worker:
+  environment:
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092   # added — emit_course_published_activity needs Kafka
+  depends_on:
+    kafka:
+      condition: service_healthy           # added — wait for Kafka before starting the worker
+```
+
+### Q: What does the observability layer give us, and why do we still need OpenTelemetry + Jaeger on top of Prometheus and logs?
+
+**A:** There are **three pillars of observability**, and they answer different questions:
+
+| Pillar | Tool | Answers | Can't answer alone |
+|---|---|---|---|
+| Metrics | Prometheus + Grafana | "HOW MANY / HOW FAST / HOW OFTEN" — aggregate numbers over time | "Why was THIS specific request slow?" |
+| Logs | structured JSON | "WHAT happened, in full detail" — discrete events | "Which log lines across 6 containers belong to the same request?" |
+| Traces | OpenTelemetry + Jaeger | "WHERE did ONE request spend its time, across all services?" | — |
+
+We built metrics + logs. Traces are the missing pillar.
+
+**Why traces matter here specifically:** one enrollment touches five processes and four data stores —
+
+```
+[api] enroll → SELECT FOR UPDATE + INSERT enrollment + INSERT outbox  (Postgres)
+   (201 returns; rest is async)
+[relay] outbox → Kafka
+[welcome-email-consumer] Kafka → dedupe (Postgres) → enqueue (RabbitMQ)
+[celery-worker] run task → read Postgres → send email
+```
+
+If a student says "I enrolled but got no welcome email," debugging *today* means grepping 4 containers' logs and manually stitching the timeline by enrollment_id. Metrics say "p95 is fine"; logs are scattered.
+
+With OpenTelemetry + Jaeger you search one `trace_id` and see the whole waterfall in one screen, with per-span timings — instantly spotting "the celery SMTP span took 240ms and timed out."
+
+**The split** (mirrors Prometheus/Grafana):
+- **OpenTelemetry** = the library in your code. Wraps each unit of work in a "span," assigns a `trace_id`, propagates it across service boundaries (HTTP headers, Kafka message headers). Produces the data.
+- **Jaeger** = the backend. Receives, stores, and draws the waterfall UI. You never write to it directly.
+
+**The payoff that unifies all three pillars:** the `trace_id` OTel generates is also injected into the structured JSON logs (the reserved `trace_id` field). So: metrics tell you *something* is wrong → traces tell you *where* → logs filtered by trace_id tell you *what* in full detail.
+
+### Q: Why is `configure_json_logging()` called in every worker file instead of once?
+
+**A:** Because **logging configuration is per-process, not per-codebase.**
+
+Each service is a separate OS process in a separate container running a separate Python interpreter:
+
+| container | entry point that calls configure_json_logging |
+|---|---|
+| api | `app/main.py` (module load) |
+| worker | `temporal_worker._run()` |
+| relay | `outbox_relay._run()` |
+| welcome-email-consumer | `welcome_email_consumer._run()` |
+| events-archiver | `events_archiver._run()` |
+| celery-worker | `celery_app` `setup_logging` signal |
+
+Python's logging config (root logger handlers + formatters) lives in *that process's memory*. There is no shared global state across processes — different interpreters, different heaps, different containers. Configuring it in `main.py` configures only the API process; the relay process never imports `main.py` (it runs `outbox_relay.py`), so without its own call it would keep Python's default plain-text format.
+
+Key distinction:
+- The **logic lives in ONE place** — `app/observability/logging.py`. Not duplicated.
+- The **call happens once per process entry point** — because each process configures its own root logger at its own startup.
+
+Same reason each worker opens its own `AsyncSessionLocal`, its own Kafka client, its own Mongo client: you cannot share an open socket, a DB pool, or a configured logger across a process boundary. Each process builds its own resources from shared code. Number of calls = number of processes (6), not number of files. A monolith would call it once; our distributed design calls it six times.
+
+### Q: If OpenTelemetry gives us tracing, why do we also need JSON logs? Is JSON logging just for representation? Is jsonlogger the same as console.log?
+
+**A:** Three sub-questions:
+
+**(a) Logs and traces are different pillars, not redundant.**
+- Logs = discrete records of *what happened*, rich free-form detail ("SMTP connection refused", "duplicate skip", "course not found").
+- Traces = the *timing + structure* of one request across services (span name + start/end + parent).
+- They're complementary: a trace says "the celery span took 240ms and errored" (WHERE); a log says "SMTP connection refused: mailserver down" (WHAT). OTel will never tell you the SMTP detail — that lives in a log line. So logs are the other half, not replaced by tracing.
+
+**(b) JSON is for machine-consumability, not representation.** Plain text is for a human reading one terminal. JSON makes every field indexable so a log aggregator (Loki, Elasticsearch, Datadog, CloudWatch) can run structured queries like `service="celery-worker" AND level="ERROR" AND event_type="user.enrolled"` and alert on them. Today we just print JSON to stdout; the moment a shipper (Promtail/Fluent Bit) is put in front of it, every field is queryable/dashboardable/alertable with **zero code change**. That's the payoff — the format is the investment.
+
+```
+container stdout (JSON) → shipper → store (Loki/Elastic) → query (Grafana/Kibana)
+```
+We're at step 1; steps 2–4 are pure ops config because the logs are already structured.
+
+**(c) jsonlogger is NOT console.log.** In Node terms: `print()` ≈ `console.log` (unstructured). Python `logging` + `python-json-logger` ≈ **Pino/Winston** in JSON mode — a logging *framework* with levels, named loggers, handlers, and a formatter that emits structured JSON. `jsonlogger.JsonFormatter` turns each `logger.info(...)` record into a JSON object instead of a string.
+
+**The complete footprints of one enrollment** (enrollment id 999):
+
+| Step | Process | Metric fired | JSON log | Trace span (future) |
+|---|---|---|---|---|
+| 1 | api | http_requests_total +1, events_emitted_total{user.enrolled} +1 | uvicorn.access 201 | `POST /enroll` + db child spans |
+| 2 | relay | outbox_published_total +1 | "published 1 events" | `relay.publish` |
+| 3 | welcome-email-consumer | events_consumed_total{outcome=enqueued} +1 | "enqueued enrollment-999" | `consumer.handle` |
+| 4 | celery-worker | celery task +1 | "welcome-email → alice@…" | `celery.send_welcome_email` |
+
+- **Metrics** answer aggregate health across all enrollments.
+- **Logs** let you find each individual line and filter by field.
+- **Traces** (not built yet) tie all four steps into ONE waterfall via a shared `trace_id`, propagated through the outbox row and the Kafka message header. Today, correlating Alice's enrollment means grepping `enrollment-999` across 4 containers; with OTel you search one `trace_id` and the whole causal chain lights up — and that same `trace_id` appears in every JSON log line, unifying all three pillars. The empty `trace_id` field in app/observability/logging.py is the hook waiting for the OTel chunk to populate.
+
+### Q: For metrics, do we `+1` on every event? Is there a queue for metrics?
+
+**A:** No queue — and that's the key difference between events and metrics.
+
+| | Events (user.enrolled …) | Metrics (counters) |
+|---|---|---|
+| Transport | Pushed through queues (outbox → Kafka → RabbitMQ) | Pulled — Prometheus scrapes /metrics |
+| Queue? | Yes | **No queue at all** |
+| Storage | Durable (Postgres → Kafka → Mongo) | In-memory number in the process |
+| Lose one? | Never acceptable | Fine — next scrape has the current total |
+| Cost each | DB write + network | `+1` in RAM (nanoseconds) |
+
+**Two kinds of metric:**
+- *Auto-instrumented* (prometheus-fastapi-instrumentator): middleware bumps `http_requests_total` / `http_request_duration_seconds` on every request. We write zero `+1` code.
+- *Custom business counters*: we DO call `.inc()` manually, e.g. `events_emitted_total.labels(event_type=..., path="outbox").inc()` in `event_service.emit()`. But `.inc()` is just `number += 1` in process RAM — not a network call, not a queue push. That's why it's cheap to do per event.
+
+**What actually happens:** the counter is a labelled set of numbers in the process's memory. `.inc()` bumps the number locally. Nothing leaves the process. Then Prometheus, on its own 10s timer, HTTP-GETs `/metrics`, the app renders the current totals as text, and Prometheus stores them as time-series points with a timestamp. Over time it builds a graph; `rate(counter[1m])` computes the per-second slope.
+
+```
+app RAM: counter += 1   ──HTTP GET /metrics every 10s──►  Prometheus stores snapshots
+   (push? NO)                                              (pull, on a timer)
+```
+
+**Counter resets:** counters live in process memory, so they reset to 0 on restart. That's expected — you query `rate(counter[5m])`, not the raw value, and Prometheus's `rate()` detects resets and handles them. The slope is what matters, not the absolute number.
+
+**Why pull-no-queue for metrics:** a metric is cheap to recompute (just the current counter), and missing a scrape is harmless because counters are cumulative. An *event*, by contrast, is a discrete fact that must not be lost — hence the durable outbox + Kafka. Different reliability needs → different transport.
+
+### Q: Where do logs, metrics, and traces get stored? Is observability data kept in our application DB?
+
+**A:** No — none of it goes in Postgres or Mongo. Each observability signal has its own dedicated, purpose-built store:
+
+| Signal | Stored by | Location (our setup) | In app DB? |
+|---|---|---|---|
+| Metrics | Prometheus TSDB | `prometheus_data` volume (`/prometheus`), 15-day retention | No |
+| Logs (now) | Docker `json-file` log driver | files on the Docker host; read via `docker-compose logs` | No |
+| Traces (Jaeger, later) | Jaeger's own backend | in-memory/Badger dev; Cassandra/Elasticsearch prod | No |
+| Grafana dashboards/users | Grafana config DB | `grafana_data` volume (SQLite) — config only, not the metrics | No |
+
+**The subtle trap:** the Mongo `events` collection IS in our DB — but it's *application data* (business facts like "Alice enrolled", queried by /admin/metrics, kept forever), NOT observability data. The JSON stdout logs are operational records of the *system* doing work (read via `docker logs`, on host disk, eventually rotated). Both involve "events" and "JSON" but are different concerns.
+
+**Why observability is deliberately kept OUT of the app DB:**
+1. Volume — millions of log lines / metric samples per day would bloat Postgres and slow transactional queries.
+2. Wrong shape — metrics are time-series, logs need full-text search, traces are span trees; relational tables are bad at all three; specialized stores are 10–100× more efficient.
+3. Blast-radius isolation — a logging spike filling observability storage must not take down the DB enrollments depend on.
+4. Retention & criticality differ — metrics ~15d, logs ~7–30d, enrollments forever; losing metrics is an inconvenience, losing an enrollment is a bug.
+
+**Dev vs prod:**
+```
+DEV:   metrics→Prometheus container; logs→stdout→Docker json-file; traces→(none yet); dashboards→Grafana container
+PROD:  metrics→Prometheus/Grafana Cloud/Datadog; logs→shipper(Promtail/Fluent Bit)→Loki/Elastic/CloudWatch;
+       traces→OTel→Jaeger/Tempo/Datadog; dashboards→Grafana
+```
+Logs are JSON precisely so the prod step is config, not code — point a shipper at stdout and every field is indexed. This follows the 12-factor rule: the app writes to stdout and the platform handles storage/routing.
+
+**Dev caveat:** Docker's default json-file driver has no rotation in our compose, so container logs grow unbounded over long runs. For a long-lived setup add `logging: {driver: json-file, options: {max-size: 10m, max-file: 3}}` per service, or ship logs off-host.
+
+### Q: How is OpenTelemetry + Jaeger wired in, and what's the current scope of tracing?
+
+**A:** Setup mirrors the logging setup — `configure_tracing(service_name)` in `app/observability/tracing.py`, called once per process (api lifespan + each worker `_run()` + the celery setup signal). It builds a `TracerProvider` with an OTLP/gRPC exporter pointed at `OTEL_EXPORTER_OTLP_ENDPOINT` (set to `http://jaeger:4317` per service in docker-compose; empty → disabled for host dev). Auto-instrumentation:
+- `FastAPIInstrumentor` — one span per HTTP request (health/metrics excluded)
+- `SQLAlchemyInstrumentor` on `engine.sync_engine` — a child span per SQL statement
+
+Jaeger runs as `jaegertracing/all-in-one` with `COLLECTOR_OTLP_ENABLED=true`; UI at http://localhost:16686, OTLP receivers on 4317 (gRPC) / 4318 (HTTP).
+
+**Logs↔traces bridge:** a `_TraceContextFilter` in `app/observability/logging.py` reads the active span context and stamps `trace_id` + `span_id` onto every log record, so the JSON logs carry the same `trace_id` Jaeger shows. Verified: an enroll request's HTTP log line and its SQL COMMIT log line share one `trace_id` (different `span_id`s).
+
+**Verified working:** a single `POST /enroll` produced an 8-span trace in Jaeger whose waterfall maps exactly to the code — `POST /enroll` → connect → SELECT (course FOR UPDATE) → SELECT (capacity) → INSERT (enrollment) → INSERT (outbox) → http send. You can literally see the outbox INSERT inside the same request as the enrollment INSERT (the atomicity, visualized). Five services report to Jaeger: api, outbox-relay, events-archiver, temporal-worker, welcome-email-consumer.
+
+**Current scope vs the "follow one request across services" ideal:** today each service produces its OWN traces, and *within* the API the request→DB path is one linked trace. The async event pipeline (API → outbox → relay → Kafka → consumer → Celery) is NOT yet stitched into a single cross-service trace. Doing that needs trace-context propagation across the async boundary:
+1. In `event_service.emit`, inject the current `traceparent` (W3C TraceContext) into the outbox row (new column or payload metadata).
+2. The relay reads `traceparent` and sets it as a Kafka message header.
+3. The consumer extracts the header and starts its span with that remote context as parent (or as a span link, which is the more correct primitive for async/queue boundaries).
+4. Propagate again into the Celery task headers.
+
+This is a known, documented extension — the synchronous-path tracing already meets the Week 3 "basic tracing available" bar; cross-async-boundary propagation is an enhancement (and is genuinely subtle — production systems often use span *links* rather than parent-child for queue hops, because the consumer runs much later and isn't a synchronous child).
+
+### Q: How does the observability stack wire up, file by file? (Prometheus + Grafana, JSON logs, OpenTelemetry + Jaeger)
+
+**A:** Note two different "observability" directories: `app/observability/` is **Python code** that runs inside each process; `observability/` (no `app/`) is **infra config** mounted into the off-the-shelf Prometheus/Grafana containers. They never import each other.
+
+**Prometheus + Grafana**
+- `app/observability/metrics.py` — defines custom counters (importing it registers them at value 0).
+- `app/services/event_service.py` — the one place that `.inc()`s `events_emitted_total`.
+- `app/main.py` — `Instrumentator().instrument(app).expose(app,"/metrics")`: middleware auto-records HTTP metrics; `/metrics` renders the whole registry as text.
+- `observability/prometheus.yml` — scrape job: GET `api:8000/metrics` every 10s.
+- `observability/grafana/provisioning/datasources/prometheus.yml` — auto-adds Prometheus as a data source.
+- `observability/grafana/provisioning/dashboards/dashboards.yml` — load dashboards from a dir.
+- `observability/grafana/dashboards/smartcourse.json` — the panels (PromQL).
+- `docker-compose.yml` — runs prometheus + grafana, mounts the configs.
+- Runtime: app keeps counters in RAM → `/metrics` renders them → Prometheus PULLS every 10s → TSDB → Grafana queries Prometheus → panels.
+
+**Structured JSON logs**
+- `app/observability/logging.py` — `_JsonFormatter` (record→JSON), `_TraceContextFilter` (stamps trace_id/span_id), `configure_json_logging(service_name)` (swaps root handler, forces uvicorn/celery loggers to propagate).
+- Called once per process: api in `main.py`; each worker in its `_run()`; celery via the `setup_logging` signal. Six processes, six calls, one implementation.
+- Runtime: `logger.info()` → root handler → filter adds trace_id → formatter renders JSON → stdout → Docker json-file (→ Loki/Datadog in prod). No DB, no network.
+
+**OpenTelemetry + Jaeger**
+- `app/observability/tracing.py` — `configure_tracing()` (TracerProvider + BatchSpanProcessor + OTLPSpanExporter→jaeger:4317; no-ops if endpoint empty), `instrument_fastapi(app)` (span per request), `instrument_sqlalchemy(engine.sync_engine)` (child span per query).
+- `app/config.py` — `otel_exporter_otlp_endpoint` ("" = disabled).
+- `app/observability/logging.py` `_TraceContextFilter` — the bridge: reads the active span's trace_id and writes it on every log record.
+- `app/main.py` + each worker — call `configure_tracing` + instrument helpers (order: configure first, then instrument).
+- `docker-compose.yml` — `jaeger` service (OTLP enabled, UI 16686); `OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317` on all 6 app services; `.env` empty default for host dev.
+- Runtime: request → FastAPIInstrumentor opens span (trace_id) → SQLAlchemyInstrumentor adds DB child spans → BatchSpanProcessor → OTLP gRPC → Jaeger stores + renders waterfall.
+
+The thread tying all three: the same `trace_id` appears in the trace (Jaeger) and on every log line (stdout) for that request.
+
+### Q: If we have JSON logs filterable by user_id (and can put logs in Grafana), why do we need tracing? And don't we still have to find a trace_id first?
+
+**A:** A log is a *flat list of events*; a trace is a *timed tree*. Filtering logs by user_id gives "the events for X in time order" — genuinely most of "what happened to this user." What it can't cheaply give:
+
+1. **Causal structure** — logs don't encode "this SQL ran because of this call because of this request"; you infer it from timestamps, which breaks down under concurrent interleaving. A trace encodes parent→child explicitly.
+2. **Per-step latency, free** — a span has start+end+duration as first-class data. From logs you'd have to log before/after every operation and subtract by hand. Traces give the waterfall automatically.
+3. **Finding the bad requests without an id** — see below.
+
+Example: *"p95 jumped 600ms→3s, why?"* Logs by user_id: pick one user, eyeball timestamps, can't easily see which step or aggregate across all slow ones. Traces: filter `duration>2s`, open one, see `SELECT … FOR UPDATE` went 5ms→2.8s = lock contention. 30s vs an hour.
+
+**"Still have to find trace_id first?"** No — you discover it by filtering on symptoms, you don't hunt for it. The flow is: METRICS alert (something's wrong, no id) → TRACES filtered by symptom like `duration>2s` or `status=500` (returns the bad requests — this is what logs can't do) → open the waterfall, find the slow span → grab its trace_id → pull logs by trace_id for full detail. metric→trace→log; trace_id is the handoff token between "where" and "what", discovered not hunted.
+
+**"We can attach logs to Grafana."** Yes — Grafana + Loki, and the modern setup is metrics+logs+traces all in Grafana. But that's logs in a nicer viewer, not logs doing what traces do. Grafana's killer feature is *linking*: a log line's trace_id becomes a click-through to the trace and back — which only works because trace_id is in both (why we stamp it on the JSON logs). It reinforces the case for tracing, doesn't replace it.
+
+**Honest scale caveat:** at SmartCourse's size, structured logs + metrics would get you through most debugging; tracing's marginal value grows with number of services per request, concurrent volume, and latency-sensitivity. We built it for the free latency waterfall (logs can't give it cheaply) and to demonstrate the production pattern. Right tool per question: metrics detect, traces localize, logs explain.
+
+### Q: Is tracing basically "total time across services"? Doesn't Prometheus already time each request? Is a trace a stack of layers?
+
+**A:** Three clarifications:
+
+**Tracing = one request's total time PLUS its decomposition.** Not an aggregate across everything — it's ONE request, broken down: total duration (root span) + each step's slice (child spans) + structure (which called which, sequential vs parallel). It captures both time *between* services (the hops) and time *within* a service (the DB query inside the API).
+
+**Prometheus DOES time requests — but only in aggregate, never decomposed.** `http_request_duration_seconds` takes one number per request (its total), drops it in a histogram, and shows the distribution across ALL requests ("p95 of all /enroll = 600ms"). It retains no individual request and no breakdown of where the 600ms went. Tracing captures every step of an individual request. Analogy: Prometheus = monthly fitness stats ("avg pace 6min/km, slowest 9"); tracing = GPS of one specific run ("km3 was 9min — traffic light here"). Prometheus says something's off; tracing says which segment. So: **Prometheus = overall health + aggregate timing; tracing = per-request decomposition.**
+
+**A trace is a tree of timed spans, drawn as a nested waterfall** — yes, "stacking of layers" is right. Each span is a bar (start position + length); children nest under their parent; overlapping bars = concurrent, sequential bars = one-after-another. It's a tree (children can have children, e.g. a downstream service's spans nest deeper), not just flat layers. Our enroll trace: root `POST /enroll` (10ms) contains child spans connect / SELECT / SELECT / INSERT / INSERT / http-send, each a slice of the 10ms. Prometheus measures the whole bar's length across all requests; tracing shows the stack inside one bar.
+
+### Q: Is Jaeger shown in Grafana? Have we added Loki? Can we see logs inside Jaeger?
+
+**A:** **Jaeger in Grafana — yes, now added.** `observability/grafana/provisioning/datasources/jaeger.yml` registers a Jaeger datasource (`url: http://jaeger:16686`); after a Grafana restart, Grafana → Explore → "Jaeger" datasource queries traces. Verified by proxying `GET /api/datasources/proxy/uid/jaeger/api/services` through Grafana — returned all 6 services. (Grafana's generic `/health` endpoint returns "Plugin unavailable" 500 for the Jaeger plugin — a known quirk; the proxy proves the datasource works.)
+
+**Loki — NOT added.** Logs still go stdout → Docker json-file driver → `docker-compose logs`. They are not in Grafana. To get them there: add a `loki` service + a shipper (Promtail/Alloy/Fluent Bit tailing container stdout) + a Loki datasource. Then Grafana links a log's `trace_id` to its trace.
+
+**Can Jaeger show our logs? No — common misconception.** Jaeger stores spans + span-level tags/events (e.g. an exception event on an errored span). It does NOT store application `logger.info(...)` stdout logs — those never go to Jaeger; only the tracing exporter's spans do. So Jaeger = traces (+ span events), not a log viewer. Seeing logs next to a trace requires a log store (Loki/Elastic) and Grafana linking via the shared `trace_id`.
+
+### Q: What changes between our current all-in-Docker setup and production?
+
+**A:** Headline: **the application image does not change** — the same `smart-course-app` image runs in prod. What changes is everything around it.
+
+1. **Orchestration:** docker-compose (single host, manual) → Kubernetes/ECS/Nomad (multi-host scheduling, self-healing, rolling deploys, autoscaling). Healthchecks → k8s readiness/liveness probes; services → Deployments; the `migrate` one-shot → a pre-deploy Job/init-container.
+
+2. **Stateful infra → managed, not plain containers:** Postgres → RDS/Cloud SQL/Aurora (backups, PITR, primary+replicas, failover); Kafka (we run 1 broker, RF 1) → MSK/Confluent/Redpanda with ≥3 brokers and RF≥3 (RF 1 = data loss on one node death); Redis → ElastiCache; Mongo → Atlas; RabbitMQ → CloudAMQP/operator; Temporal all-in-one → Temporal Cloud or a real cluster. You don't run source-of-truth stores as ephemeral containers.
+
+3. **Strip dev conveniences:** `uvicorn --reload` + `./app` bind-mount → `gunicorn -w 4 -k uvicorn.workers.UvicornWorker`, code baked into the image; `watchfiles` wrappers → plain `python -m`; remove mongo-express/kafka-ui/Grafana admin-admin/anonymous access; `KAFKA_AUTO_CREATE_TOPICS_ENABLE` off, topics created explicitly with partitions + RF.
+
+4. **Secrets & config:** `.env` plaintext SECRET_KEY/passwords → secrets manager (Vault/AWS Secrets Manager/k8s Secrets); per-service env injected by the orchestrator pointing at managed endpoints.
+
+5. **Scaling & networking:** API + workers run N replicas (Kafka consumer groups partition automatically; relay's FOR UPDATE SKIP LOCKED makes multi-relay safe); only the ingress (API+frontend) is public, everything else on the private network (today all on localhost ports); TLS everywhere (https, amqps, Kafka SASL/TLS, Mongo TLS).
+
+6. **Observability hardening:** Prometheus 1-container + static targets → HA Prometheus/Thanos/Mimir or managed, with service discovery + long-term storage; logs stdout (no rotation!) → shipper → Loki/Elastic/CloudWatch with retention; Jaeger all-in-one in-memory (traces lost on restart) → Jaeger with Cassandra/ES backend or Grafana Tempo, plus sampling; Grafana admin/admin → SSO. (Provisioned dashboards/datasources already carry over.)
+
+7. **CI/CD & frontend:** build image in CI → registry → deploy via pipeline/GitOps, migrations as a gated step; frontend `npm run dev` (Vite dev server) → `npm run build` → static files on CDN/object storage/nginx.
+
+What's already prod-shaped and carries over unchanged: the layered app, one-image-many-roles design, healthchecks, provisioned Grafana, structured JSON logs, and the outbox/idempotency/dedupe correctness. The work is mostly platform (k8s + managed infra + secrets + TLS), not application rewrite.
+
+### Q: Can we see traces in Grafana the same as in Jaeger? And we added Loki — what's the full picture now?
+
+**A:** **Traces in Grafana = same data, different front-end.** With the Jaeger datasource added, Grafana → Explore → Jaeger renders the identical waterfall (same spans, timings, tags) because it queries the same Jaeger backend. The value isn't different data — it's the unified pane + cross-signal linking. Jaeger's native UI keeps a few trace-specialist extras (service dependency graph, trace compare); for reading a trace they're equivalent.
+
+**Loki — now added**, completing the logs pillar in Grafana:
+- `loki` service (single-binary, built-in default config) + `promtail` service (tails every container's stdout via the Docker socket using `docker_sd_configs`, ships JSON lines to Loki).
+- `observability/promtail.yml` — docker service-discovery; labels streams by `container`. Only needs the Docker socket mounted (no host log-file paths → works on Docker Desktop).
+- `observability/grafana/provisioning/datasources/loki.yml` — Loki datasource WITH a `derivedFields` entry: a regex pulls `trace_id` out of each JSON log line and turns it into a clickable link to the Jaeger datasource. That's the logs→traces click-through.
+
+**Verified end-to-end after a 6-lifecycle traffic burst:**
+- Prometheus: events_emitted, request rate, p95 all populated.
+- Jaeger: latest enroll trace = 8 spans.
+- Loki: thousands of log lines across all 5 app containers; queryable via the Loki API and through the Grafana datasource proxy.
+- A real log line carried `trace_id: f0c756f5…` — so the derived-field link has something to match.
+- Mongo: 23 user.enrolled / 16 course.published / 15 lesson.completed.
+
+**The full single-pane-of-glass is now live in Grafana:** metrics (Prometheus) + logs (Loki) + traces (Jaeger), tied together by `trace_id` — from a log line you can jump to its trace; metrics tell you something's wrong, the trace localizes it, the log explains it. (Note: Promtail is in LTS; Grafana now steers new setups to Alloy — same role, different agent.)
+
+**Counter-vs-store nuance observed:** Prometheus `events_emitted_total` showed 13 while Mongo had 23 user.enrolled. Not a bug — the Prometheus counter is in-memory and resets on API restart (counts emits since the process started; also only counts the outbox-path emits from the API, not the Temporal-direct course.published), whereas Mongo accumulates every event ever archived. Different lifecycles: metrics = current-process cumulative (queried via rate()), event log = permanent.

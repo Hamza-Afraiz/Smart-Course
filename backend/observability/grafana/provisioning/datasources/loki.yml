@@ -1,0 +1,19 @@
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      # Derived field: pull trace_id out of our JSON log lines and turn it into
+      # a clickable link that jumps to that trace in the Jaeger datasource.
+      # This is the logs↔traces correlation — possible only because every log
+      # line carries the same trace_id the trace is keyed on.
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id":\s*"(\w+)"'
+          url: '${__value.raw}'
+          datasourceUid: jaeger

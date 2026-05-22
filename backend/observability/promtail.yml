@@ -1,0 +1,29 @@
+# Promtail — tails every container's stdout (via the Docker API) and ships
+# the lines to Loki. Uses docker service-discovery, so it only needs the
+# Docker socket mounted — no host log-file paths (works on Docker Desktop).
+#
+# Note: Promtail is in LTS (Grafana now steers new setups to Alloy). It's
+# still fully functional and the simplest thing to read for learning.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # label each stream by container name (strip the leading "/")
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: logstream

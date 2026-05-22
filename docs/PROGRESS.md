@@ -2,8 +2,8 @@
 
 Single source of truth for what's done and what's next across all 5 weeks. Update this doc whenever a milestone moves.
 
-**Last updated:** 2026-05-14
-**Current focus:** Week 2 complete + React UI added for end-to-end testing — Week 3 (events + observability) next
+**Last updated:** 2026-05-22
+**Current focus:** Week 3 essentially complete — event-driven (outbox → Kafka → consumers → Celery), Mongo event log, analytics endpoints, and full observability (Prometheus metrics + Grafana, structured JSON logs, OpenTelemetry → Jaeger tracing). Part A done; Week 4 (embeddings/pgvector) next.
 
 ---
 
@@ -87,24 +87,44 @@ Single source of truth for what's done and what's next across all 5 weeks. Updat
 
 ---
 
-### 🔴 Week 3 — Event-Driven + Observability — ⬜ NOT STARTED
+### 🟢 Week 3 — Event-Driven + Observability — ✅ COMPLETE
+
+**Built:** transactional outbox + relay → Kafka; 3 events (`user.enrolled`, `lesson.completed` via outbox; `course.published` direct from a Temporal activity); welcome-email consumer + Celery worker; `processed_events` consumer-side dedupe; MongoDB `events` archiver (raw interaction log); 5 admin analytics endpoints (Postgres + Mongo); Prometheus `/metrics` + Grafana dashboard; structured JSON logs across all 6 services; OpenTelemetry → Jaeger tracing (request + DB child spans, `trace_id` in logs). All three failure modes (Kafka outage, duplicate, consumer downtime) stress-tested and pass.
+
+**Known extension (not blocking Week 3's bar):** cross-service trace propagation across the async boundary. Today each service produces its own traces and the synchronous API→DB path is one linked trace; stitching API→relay→Kafka→consumer→Celery into a *single* trace needs context propagation — inject `traceparent` into the outbox row, carry it in the Kafka message header, and restore it in the consumer. Documented in docs/QA.md.
+
+#### Original checklist (for reference)
+
+**Suggested execution order** (proves the pattern on one event before scaling out — avoids the "everything is 80% done, nothing works" failure mode):
+
+1. **Pick `user.enrolled` and walk backwards from the consumer.** The welcome-email task tells you what the payload needs. Design the event schema (idempotency key + thin payload of IDs only).
+2. **Outbox table + atomic emit.** Add `outbox` table; `enrollment_service.enroll()` inserts the event row in the same Postgres transaction as the enrollment row. Now event emission is ACID-atomic with the business write — no dual-write problem at this layer.
+3. **Verify atomic emit standalone.** Enroll a user, confirm the outbox row is there. Don't bring Kafka in yet.
+4. **Outbox relay** — separate process polls `outbox WHERE sent_at IS NULL`, publishes to Kafka, marks `sent_at`. At-least-once delivery; durable across crashes because the row stays until the relay confirms the send.
+5. **Kafka + consumer + dedupe + welcome-email Celery task** — first event end-to-end. `processed_events` table on consumer side (or Redis with TTL) catches duplicates from relay retries / consumer rebalances. Result: effectively-once.
+6. **Stress-test failure modes** before scaling out: kill Kafka mid-relay (verify retry), inject a duplicate (verify dedupe skip), crash the consumer mid-process (verify offset behavior). Trust the pattern before copying it.
+7. **Replicate for `lesson.completed`** (outbox in `enrollment_service.complete_lesson`) and **`course.published`** (emitted from inside the Temporal workflow as an activity — no outbox needed there because Temporal already provides durable orchestration; just give the activity an idempotency key).
+8. **Analytics endpoints** — SQL rollups over Postgres core tables + the Mongo `events` log (storage decision per QA.md "Final storage architecture"). Materialized views for the slower aggregates.
+9. **Observability** — Prometheus `/metrics` + structured JSON logs early (cheap, useful for debugging the work above). Full OpenTelemetry + Jaeger last, once flows are stable enough to be worth instrumenting.
 
 | Item | Status | Notes |
 |---|---|---|
-| Kafka cluster up (`docker-compose --profile week3`) | ⬜ | KRaft mode, Bitnami image |
-| Kafka producer for `user.enrolled` | ⬜ | Emitted after enrollment commits |
-| Kafka producer for `course.published` | ⬜ | Emitted by Temporal workflow on success |
-| Kafka producer for `lesson.completed` | ⬜ | |
-| Schema registry / event schemas | ⬜ | Versioned, backward compatible |
-| Idempotency keys on every event | ⬜ | Consumer-side dedup |
-| Celery worker process | ⬜ | RabbitMQ broker (already up) |
-| Celery task: send enrollment confirmation email | ⬜ | (stub email — log to console) |
-| Celery task: update analytics aggregates | ⬜ | Reads from existing tables |
-| Analytics endpoints | ⬜ | Enrollments per course, completion rate, etc. |
-| Prometheus metrics endpoint | ⬜ | Request count, latency, error rate |
-| OpenTelemetry tracing | ⬜ | Trace through router → service → repo → DB |
-| Grafana dashboards | ⬜ | At least: requests, errors, DB connections |
-| Jaeger UI for traces | ⬜ | |
+| `user.enrolled` event schema + outbox table | 🚧 | Step 1–2 of the order above |
+| Atomic outbox emit from `enrollment_service.enroll` | ⬜ | Same DB transaction as the enrollment row |
+| Outbox relay process (poll → Kafka → mark sent) | ⬜ | At-least-once; survives crashes |
+| Kafka cluster up | ⬜ | Still gated by `week3` profile until consumer is ready |
+| Kafka producer (driven by the relay) | ⬜ | Emitted from outbox, not from request path |
+| `processed_events` dedupe table | ⬜ | Consumer-side idempotency |
+| Celery worker + welcome-email task | ⬜ | First side-effect task; logs to console as stub |
+| End-to-end smoke test for `user.enrolled` | ⬜ | Prove the pattern before replicating |
+| Kafka producer for `course.published` | ⬜ | Emitted from inside the Temporal activity — no outbox needed (Temporal IS durable) |
+| Kafka producer for `lesson.completed` | ⬜ | Outbox in `complete_lesson` |
+| Analytics endpoints | ⬜ | SQL rollups + Mongo `events` log |
+| Mongo `events` collection (raw interaction log) | ⬜ | Per QA.md "Final storage architecture" |
+| Prometheus `/metrics` endpoint | ⬜ | Request count, latency, error rate, DB pool |
+| Structured JSON logging | ⬜ | With `trace_id` correlation field |
+| OpenTelemetry tracing | ⬜ | FastAPI + SQLAlchemy + Kafka + Temporal instrumentation |
+| Grafana dashboards + Jaeger UI | ⬜ | Last; instrument once flows are stable |
 
 **Deliverables (from EXECUTION_GUIDELINES.md):**
 - [ ] Event-driven flows working

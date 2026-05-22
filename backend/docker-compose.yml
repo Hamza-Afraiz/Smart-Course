@@ -85,6 +85,102 @@ services:
       - "8080:8080"  # Temporal Web UI — http://localhost:8080
     restart: unless-stopped
 
+  # ─── MongoDB — raw event log (the `events` collection) ──────────────────────
+  # PostgreSQL is still the source of truth for users / courses / enrollments
+  # / progress / certificates (+ chunks & embeddings later via pgvector).
+  # Mongo holds the high-volume, append-only event log the analytics layer
+  # queries. Storage decision recorded in docs/QA.md.
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongo-express:
+    image: mongo-express:1.0.2
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      ME_CONFIG_MONGODB_URL: mongodb://mongo:27017
+      ME_CONFIG_BASICAUTH: "false"
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+    ports:
+      - "8082:8081"  # Mongo UI — http://localhost:8082
+    restart: unless-stopped
+
+  # ─── Observability — Prometheus (metrics) + Grafana (dashboards) ────────────
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    ports:
+      - "9090:9090"  # http://localhost:9090
+    restart: unless-stopped
+
+  # Jaeger — distributed tracing backend + UI. Accepts spans over OTLP
+  # (gRPC :4317, HTTP :4318) and renders the per-request waterfall at :16686.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI — http://localhost:16686
+      - "4317:4317"    # OTLP gRPC receiver
+      - "4318:4318"    # OTLP HTTP receiver
+    restart: unless-stopped
+
+  # Loki — log store. Runs single-binary on its built-in default config.
+  loki:
+    image: grafana/loki:3.2.0
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+
+  # Promtail — tails every container's stdout via the Docker socket and ships
+  # the JSON log lines to Loki. The log shipper half of the logs pillar.
+  promtail:
+    image: grafana/promtail:3.2.0
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./observability/promtail.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"  # http://localhost:3000  (login admin/admin)
+    restart: unless-stopped
+
   # ─── App containers — API + Temporal worker (one image, three roles) ────────
   # Built from ./Dockerfile. The whole stack comes up with:
   #   docker-compose up -d --build
@@ -120,6 +216,9 @@ services:
       CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       CELERY_RESULT_BACKEND: redis://redis:6379/1
       TEMPORAL_HOST: temporal:7233
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB: smartcourse
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     ports:
       - "8000:8000"
     volumes:
@@ -145,6 +244,9 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       TEMPORAL_HOST: temporal:7233
+      # emit_course_published_activity publishes directly to Kafka — bypasses the outbox
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     volumes:
       - ./app:/app/app
     depends_on:
@@ -152,14 +254,16 @@ services:
         condition: service_completed_successfully
       temporal:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     restart: unless-stopped
 
-  # ─── Week 3: Kafka (event streaming) ────────────────────────────────────────
-  # Activate with: docker-compose --profile week3 up
+  # ─── Kafka (event streaming) — core since Week 3 ────────────────────────────
 
   kafka:
-    image: bitnami/kafka:3.6
-    profiles: ["week3"]
+    # Bitnami removed `bitnami/kafka:*` from Docker Hub mid-2025;
+    # `bitnamilegacy/*` is the same image under the new public path.
+    image: bitnamilegacy/kafka:3.6
     environment:
       # KRaft mode — no ZooKeeper needed
       KAFKA_CFG_NODE_ID: 1
@@ -170,6 +274,8 @@ services:
       KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Topics are created on first publish — fine for our small set of events
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
       ALLOW_PLAINTEXT_LISTENER: "yes"
     ports:
       - "9094:9094"  # External access from host machine
@@ -184,7 +290,6 @@ services:
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
-    profiles: ["week3"]
     depends_on:
       - kafka
     environment:
@@ -194,8 +299,102 @@ services:
       - "8081:8080"  # Kafka UI — http://localhost:8081
     restart: unless-stopped
 
+  # outbox relay — drains the Postgres `outbox` table into Kafka. Same image
+  # as api/worker; just a different command. Long-running poller.
+  relay:
+    image: smart-course-app   # built by the `migrate` service above
+    # watchfiles gives the relay hot-reload during dev, same as the worker
+    command: ["watchfiles", "python -m app.workers.outbox_relay", "app"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Kafka → Celery bridge for `events.user.enrolled`. One process per consumer
+  # group: dedupes via `processed_events`, enqueues the welcome-email task.
+  welcome-email-consumer:
+    image: smart-course-app
+    command: ["watchfiles", "python -m app.workers.welcome_email_consumer", "app"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Universal Kafka consumer — writes every event from every `events.*` topic
+  # into MongoDB's `events` collection. The raw interaction log the analytics
+  # layer queries. Uses the same dedupe + upsert pattern as welcome-email,
+  # plus a unique-index on event_key for belt-and-suspenders idempotency.
+  events-archiver:
+    image: smart-course-app
+    command: ["watchfiles", "python -m app.workers.events_archiver", "app"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MONGO_URL: mongodb://mongo:27017
+      MONGO_DB: smartcourse
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery worker — executes side-effect tasks (welcome email today,
+  # analytics rollups and notifications later). One image, many task types.
+  celery-worker:
+    image: smart-course-app
+    # `--without-gossip --without-mingle` cut chatter for a single-replica dev setup
+    command: ["watchfiles", "celery -A app.workers.celery_app worker --loglevel=info --without-gossip --without-mingle", "app"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
   rabbitmq_data:
   kafka_data:
+  mongo_data:
+  prometheus_data:
+  grafana_data:

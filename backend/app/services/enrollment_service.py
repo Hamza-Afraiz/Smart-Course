@@ -20,6 +20,7 @@ from app.models.progress import Progress
 from app.models.user import User
 from app.repositories import enrollment_repo, lesson_repo, progress_repo
 from app.schemas.enrollment import ProgressSummary
+from app.services import event_service
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,27 @@ async def enroll(
         # uq_enrollment_student_course — already enrolled
         await db.rollback()
         raise AlreadyEnrolledError("Already enrolled in this course")
+
+    # Emit `user.enrolled` into the outbox in the SAME transaction as the
+    # enrollment INSERT. Both rows commit together or neither does — no
+    # dual-write to Kafka at request time. A relay process publishes later.
+    # Thin payload: just IDs. Consumers fetch fresh user/course data from DB
+    # so it can't go stale (e.g. user later changes their name).
+    await event_service.emit(
+        db,
+        event_type="user.enrolled",
+        event_key=f"enrollment-{enrollment.id}",
+        payload={
+            "enrollment_id": str(enrollment.id),
+            "student_id": str(enrollment.student_id),
+            "course_id": str(enrollment.course_id),
+            "enrolled_at": (
+                enrollment.enrolled_at.isoformat()
+                if enrollment.enrolled_at is not None
+                else None
+            ),
+        },
+    )
 
     return enrollment
 
@@ -134,7 +156,29 @@ async def complete_lesson(
                 lesson_id,
             )
             raise
-        return existing
+        return existing  # idempotent path — no event emitted on duplicate calls
+
+    # Emit `lesson.completed` in the SAME transaction as the progress INSERT.
+    # Thin payload: IDs only. The event_key uses the (enrollment, lesson) pair
+    # since that's the natural business identity — a redelivery of the same
+    # completion always carries the same key.
+    await event_service.emit(
+        db,
+        event_type="lesson.completed",
+        event_key=f"progress-{enrollment_id}-{lesson_id}",
+        payload={
+            "progress_id":   str(progress.id),
+            "enrollment_id": str(enrollment_id),
+            "student_id":    str(student.id),
+            "course_id":     str(enrollment.course_id),
+            "lesson_id":     str(lesson_id),
+            "completed_at": (
+                progress.completed_at.isoformat()
+                if progress.completed_at is not None
+                else None
+            ),
+        },
+    )
 
     # Auto-complete the enrollment when every lesson is done.
     # Safe to query inside this transaction — flush() above made the insert

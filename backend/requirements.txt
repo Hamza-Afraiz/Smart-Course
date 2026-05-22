@@ -25,3 +25,25 @@ anyio==4.7.0
 
 # ── Temporal (Week 2 Chunk B — publishing workflow) ───────────────────────────
 temporalio==1.27.0
+
+# ── Kafka (Week 3 — event streaming) ──────────────────────────────────────────
+aiokafka==0.11.0              # pure-async Kafka client; used by outbox relay and consumers
+
+# ── Celery (Week 3 — background task execution) ───────────────────────────────
+celery==5.4.0                 # RabbitMQ-backed task queue for side-effect work (emails, analytics)
+redis==5.2.0                  # required by Celery's Redis result backend (CELERY_RESULT_BACKEND)
+
+# ── MongoDB (Week 3 — raw interaction/event log) ──────────────────────────────
+motor==3.6.0                  # async MongoDB driver used by the events_archiver consumer
+
+# ── Observability (Week 3 — metrics + structured logs) ────────────────────────
+prometheus-fastapi-instrumentator==7.0.0  # auto request metrics + /metrics endpoint
+prometheus-client==0.21.0                  # custom counters/gauges (events emitted, etc.)
+python-json-logger==2.0.7                  # structured JSON log formatter
+
+# ── Observability (Week 3 — distributed tracing) ──────────────────────────────
+opentelemetry-sdk==1.27.0                          # tracer provider + span processors
+opentelemetry-exporter-otlp-proto-grpc==1.27.0     # ship spans to Jaeger over OTLP/gRPC (:4317)
+opentelemetry-instrumentation-fastapi==0.48b0      # auto spans for HTTP requests
+opentelemetry-instrumentation-sqlalchemy==0.48b0   # auto child spans for DB queries
+opentelemetry-instrumentation-logging==0.48b0      # inject trace_id/span_id into log records

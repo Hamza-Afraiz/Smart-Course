@@ -6,11 +6,22 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from prometheus_fastapi_instrumentator import Instrumentator
 from temporalio.client import Client
 
 from app.config import settings
 from app.database import engine
+from app.observability.logging import configure_json_logging
+from app.observability.tracing import (
+    configure_tracing,
+    instrument_fastapi,
+    instrument_sqlalchemy,
+)
 
+# JSON logs + tracing from the very first line — before logger objects cache
+configure_json_logging(service_name="api")
+configure_tracing(service_name="api")
+instrument_sqlalchemy(engine)
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +50,18 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+# ── Prometheus instrumentation ────────────────────────────────────────────────
+# Auto request metrics (http_requests_total, http_request_duration_seconds, ...)
+# + the /metrics endpoint Prometheus scrapes. Custom business counters defined
+# in app.observability.metrics are picked up by the same default registry.
+Instrumentator(
+    should_group_status_codes=False,
+    excluded_handlers=["/metrics", "/health"],
+).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+# OpenTelemetry — one span per request, propagated downstream
+instrument_fastapi(app)
 
 # ── Middleware ────────────────────────────────────────────────────────────────
 
@@ -69,12 +92,14 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 from app.routers.auth import router as auth_router
 from app.routers.courses import router as courses_router
 from app.routers.enrollments import router as enrollments_router
+from app.routers.metrics import router as metrics_router
 from app.routers.users import router as users_router
 
 app.include_router(auth_router, prefix="/api/v1/auth")
 app.include_router(users_router, prefix="/api/v1/users")
 app.include_router(courses_router, prefix="/api/v1/courses")
 app.include_router(enrollments_router, prefix="/api/v1/enrollments")
+app.include_router(metrics_router, prefix="/api/v1/admin/metrics")
 
 # ── Health Check ──────────────────────────────────────────────────────────────
 

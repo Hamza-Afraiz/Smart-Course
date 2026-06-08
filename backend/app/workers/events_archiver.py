@@ -110,10 +110,12 @@ async def _archive(msg) -> str:
 async def _run() -> None:
     from app.observability.logging import configure_json_logging
     from app.observability.tracing import configure_tracing, instrument_sqlalchemy
+    from app.observability.metrics_server import start_metrics_server
     from app.database import engine
     configure_json_logging(service_name="events-archiver")
     configure_tracing(service_name="events-archiver")
     instrument_sqlalchemy(engine)
+    start_metrics_server()  # Prometheus → up{job="events-archiver"}
 
     await init_indexes()
     logger.info("events-archiver: Mongo indexes ready")

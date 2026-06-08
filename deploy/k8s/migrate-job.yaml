@@ -1,0 +1,24 @@
+# One-shot DB migration. Runs to completion before the app rolls out
+# (gate the rollout on this Job in CI). Equivalent to the `migrate` compose service.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: smartcourse-migrate
+  namespace: smartcourse
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: REGISTRY/smart-course-app:TAG
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: smartcourse-config
+            - secretRef:
+                name: smartcourse-secrets
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }

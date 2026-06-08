@@ -96,10 +96,12 @@ async def _handle(msg) -> str:
 async def _run() -> None:
     from app.observability.logging import configure_json_logging
     from app.observability.tracing import configure_tracing, instrument_sqlalchemy
+    from app.observability.metrics_server import start_metrics_server
     from app.database import engine
     configure_json_logging(service_name="welcome-email-consumer")
     configure_tracing(service_name="welcome-email-consumer")
     instrument_sqlalchemy(engine)
+    start_metrics_server()  # Prometheus → up{job="welcome-email-consumer"}
 
     consumer = AIOKafkaConsumer(
         TOPIC,

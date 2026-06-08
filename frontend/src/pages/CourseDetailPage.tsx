@@ -31,6 +31,8 @@ import {
 } from "../components/ui";
 import ModuleManager from "./course-detail/ModuleManager";
 import LessonList from "./course-detail/LessonList";
+import SearchPanel from "./course-detail/SearchPanel";
+import AssistantPanel from "./course-detail/AssistantPanel";
 
 export default function CourseDetailPage() {
   const { courseId = "" } = useParams();
@@ -299,6 +301,14 @@ export default function CourseDetailPage() {
             </>
           )}
         </section>
+      )}
+
+      {/* ── Ask this course (semantic search + RAG assistant) ─────────── */}
+      {course.status === "published" && (
+        <>
+          <AssistantPanel courseId={courseId} />
+          <SearchPanel courseId={courseId} />
+        </>
       )}
 
       {/* ── Curriculum ─────────────────────────────────────────────────── */}

@@ -7,16 +7,18 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# psycopg 3 loads the libpq shared library at runtime
+# psycopg 3 loads libpq at runtime; ffmpeg decodes video → audio for Whisper
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libpq5 \
+    && apt-get install -y --no-install-recommends libpq5 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# deps first — this layer stays cached when only app code changes
+# deps first — this layer stays cached when only app code changes.
+# torch is big (~150MB); bigger pip timeouts + retries make sure slow
+# networks don't fail the build mid-download.
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --timeout 600 --retries 10 -r requirements.txt
 
 # baked-in code. docker-compose bind-mounts ./app over this for dev hot-reload,
 # but the image is self-contained for a plain `docker run`.

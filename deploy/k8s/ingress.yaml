@@ -1,0 +1,26 @@
+# Public entrypoint. Only the API is exposed; every managed service + every
+# worker stays private. TLS terminated here (cert-manager issues the cert).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: smartcourse-api
+  namespace: smartcourse
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["api.smartcourse.example"]
+      secretName: smartcourse-api-tls
+  rules:
+    - host: api.smartcourse.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: smartcourse-api
+                port:
+                  number: 80

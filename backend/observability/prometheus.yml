@@ -13,6 +13,71 @@ scrape_configs:
         labels:
           service: api
 
+  # The long-running workers each expose /metrics on :9100 (see
+  # app/observability/metrics_server.py). This is what makes `up{job=...} == 0`
+  # detectable — the basis of the "service down" alert.
+  - job_name: relay
+    static_configs:
+      - targets: ["relay:9100"]
+        labels: { service: relay }
+  - job_name: welcome-email-consumer
+    static_configs:
+      - targets: ["welcome-email-consumer:9100"]
+        labels: { service: welcome-email-consumer }
+  - job_name: events-archiver
+    static_configs:
+      - targets: ["events-archiver:9100"]
+        labels: { service: events-archiver }
+  - job_name: temporal-worker
+    static_configs:
+      - targets: ["worker:9100"]
+        labels: { service: temporal-worker }
+  - job_name: celery-worker
+    static_configs:
+      - targets: ["celery-worker:9100"]
+        labels: { service: celery-worker }
+
+  # ── blackbox probes — dependencies that don't expose Prometheus metrics.
+  # Prometheus hits blackbox-exporter:9115/probe?target=<x>; the exporter
+  # connects to <x> and returns probe_success (1/0). The relabel block rewrites
+  # the scrape so `instance` = the real target while the request goes to the
+  # exporter.
+
+  # Ollama (RAG LLM) over HTTP — makes UC4 (assistant down) alertable.
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets: ["http://ollama:11434/"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # Infra dependencies over TCP (connect-only liveness).
+  - job_name: blackbox-tcp
+    metrics_path: /probe
+    params: { module: [tcp_connect] }
+    static_configs:
+      - targets:
+          - postgres:5432
+          - redis:6379
+          - rabbitmq:5672
+          - kafka:9092
+          - mongo:27017
+          - temporal:7233
+          - minio:9000
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
   # Prometheus scrapes its own /metrics — useful for "is Prometheus healthy?"
   - job_name: prometheus
     static_configs:

@@ -1,0 +1,19 @@
+# blackbox-exporter modules. It probes endpoints from outside and exports
+# `probe_success` (1/0) — the way to monitor things that don't expose their
+# own Prometheus metrics (Ollama + the managed-style infra dependencies).
+modules:
+  # HTTP GET, success on any 2xx. Used for Ollama's API root.
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      valid_status_codes: []   # default: 2xx
+
+  # Plain TCP connect — success if the port accepts a connection. Used for
+  # Postgres/Redis/RabbitMQ/Kafka/Mongo/Temporal/MinIO (no HTTP needed).
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4

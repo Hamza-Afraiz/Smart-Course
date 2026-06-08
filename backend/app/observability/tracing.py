@@ -74,3 +74,18 @@ def instrument_sqlalchemy(engine) -> None:
 
     # async engines expose the real engine under .sync_engine
     SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)
+
+
+def instrument_httpx() -> None:
+    """Auto child-span every outbound httpx request (notably the Ollama LLM call).
+
+    Without this, the assistant's call to Ollama is an invisible gap in the
+    trace: the DB span finishes, then nothing until the streamed response ends.
+    Instrumenting httpx turns that gap into a named `POST /api/chat` span, so
+    Jaeger shows the LLM time explicitly — the dominant cost of a RAG answer.
+    """
+    if not _configured:
+        return
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+    HTTPXClientInstrumentor().instrument()

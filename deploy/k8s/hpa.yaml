@@ -1,0 +1,139 @@
+# Horizontal Pod Autoscalers — scale pod COUNT on CPU load.
+#
+# Requires metrics-server in the cluster (EKS: `kubectl apply -f
+# https://github.com/kubernetes-sigs/metrics-server/...`). HPA reads each
+# pod's CPU against the `resources.requests.cpu` set in the Deployments, so
+# those requests must be present (they are).
+#
+# Why per-workload targets differ:
+#   - api: request-bound; scale aggressively to keep p95 low.
+#   - worker: CPU-heavy (Whisper/embedding); scale on sustained load.
+#   - relay/consumers: scale with event/queue throughput.
+#
+# Note: HPA controls REPLICAS. When all nodes are full, the cluster autoscaler
+# (separate, EKS-managed) adds EC2 nodes. Two layers: HPA = more pods,
+# cluster-autoscaler = more nodes.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartcourse-api
+  namespace: smartcourse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartcourse-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartcourse-worker
+  namespace: smartcourse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartcourse-worker
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleDown:
+      # Whisper jobs are bursty; don't thrash replicas down too fast.
+      stabilizationWindowSeconds: 300
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartcourse-relay
+  namespace: smartcourse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartcourse-relay
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartcourse-welcome-email-consumer
+  namespace: smartcourse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartcourse-welcome-email-consumer
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartcourse-events-archiver
+  namespace: smartcourse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartcourse-events-archiver
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartcourse-celery-worker
+  namespace: smartcourse
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartcourse-celery-worker
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

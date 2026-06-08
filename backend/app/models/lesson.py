@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -34,8 +34,25 @@ class Lesson(Base):
     content_type: Mapped[ContentType | None] = mapped_column(
         SAEnum(ContentType, name="contenttype")
     )
-    # URL pointing to file on S3/CDN — not stored in DB directly
+    # ── Content source (video/pdf can come from EITHER of these) ──────────────
+    # External URL — instructor pasted a YouTube / CDN link.
     content_url: Mapped[str | None] = mapped_column(String(1000))
+    # Object-store key — instructor uploaded a file to our MinIO/S3 bucket.
+    # When set, it takes precedence over content_url for both extraction and
+    # playback (see lesson_service.effective_source).
+    storage_key: Mapped[str | None] = mapped_column(String(1000))
+    mime_type: Mapped[str | None] = mapped_column(String(255))
+    file_size: Mapped[int | None] = mapped_column(BigInteger)
+    # Inline body — used for `text` content. Stored directly so the Week 4
+    # chunking pipeline can split it without a fetch+parse roundtrip.
+    content_text: Mapped[str | None] = mapped_column(Text)
+
+    # ── Extraction cache (video transcript / pdf text) ───────────────────────
+    # Avoids re-running Whisper / pypdf on every re-publish. Invalidated when
+    # `cached_text_source` no longer matches the lesson's effective source.
+    cached_text: Mapped[str | None] = mapped_column(Text)
+    cached_text_source: Mapped[str | None] = mapped_column(String(1100))
+
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
     # only meaningful for video content_type, nullable for text/pdf
     duration_seconds: Mapped[int | None] = mapped_column(Integer)

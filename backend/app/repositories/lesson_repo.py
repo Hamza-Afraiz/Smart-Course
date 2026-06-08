@@ -54,6 +54,10 @@ async def create(
     order_index: int,
     content_type: ContentType | None,
     content_url: str | None,
+    content_text: str | None,
+    storage_key: str | None,
+    mime_type: str | None,
+    file_size: int | None,
     duration_seconds: int | None,
 ) -> Lesson:
     lesson = Lesson(
@@ -62,6 +66,10 @@ async def create(
         order_index=order_index,
         content_type=content_type,
         content_url=content_url,
+        content_text=content_text,
+        storage_key=storage_key,
+        mime_type=mime_type,
+        file_size=file_size,
         duration_seconds=duration_seconds,
     )
     db.add(lesson)

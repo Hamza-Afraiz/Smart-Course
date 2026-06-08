@@ -97,10 +97,12 @@ async def _run_one_tick(producer: AIOKafkaProducer) -> int:
 async def _run() -> None:
     from app.observability.logging import configure_json_logging
     from app.observability.tracing import configure_tracing, instrument_sqlalchemy
+    from app.observability.metrics_server import start_metrics_server
     from app.database import engine
     configure_json_logging(service_name="outbox-relay")
     configure_tracing(service_name="outbox-relay")
     instrument_sqlalchemy(engine)
+    start_metrics_server()  # Prometheus scrapes :9100 → up{job="relay"}
     stop_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()

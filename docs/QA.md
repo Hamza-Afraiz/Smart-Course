@@ -2699,3 +2699,525 @@ What's already prod-shaped and carries over unchanged: the layered app, one-imag
 **The full single-pane-of-glass is now live in Grafana:** metrics (Prometheus) + logs (Loki) + traces (Jaeger), tied together by `trace_id` — from a log line you can jump to its trace; metrics tell you something's wrong, the trace localizes it, the log explains it. (Note: Promtail is in LTS; Grafana now steers new setups to Alloy — same role, different agent.)
 
 **Counter-vs-store nuance observed:** Prometheus `events_emitted_total` showed 13 while Mongo had 23 user.enrolled. Not a bug — the Prometheus counter is in-memory and resets on API restart (counts emits since the process started; also only counts the outbox-path emits from the API, not the Temporal-direct course.published), whereas Mongo accumulates every event ever archived. Different lifecycles: metrics = current-process cumulative (queried via rate()), event log = permanent.
+
+### Q: When something goes wrong, where do I look first? What are realistic use cases to practice the observability stack?
+
+**A:** Pick the first tool by what you *already know*:
+
+| You know | Start with | Why |
+|---|---|---|
+| Aggregate / numbers look off | METRICS (Prometheus/Grafana) | Aggregate detection — find the affected requests |
+| The specific user/entity | LOGS (Loki by id) or Mongo events | Per-entity narrative |
+| A workflow is stuck | Temporal UI | Specialized state visualization |
+| An event isn't moving | Kafka UI (consumer lag) → RabbitMQ (queue depth) → consumer/Celery logs | Pipeline-stage isolation |
+| Things look broken overall | `docker-compose ps` + container logs | Start from health |
+
+**Drill direction:** metrics → trace → log. Metrics tell you *something* is wrong (no id needed). Traces filtered by symptom (`duration>2s`, `status=500`) tell you *where* — and give you a trace_id. Logs filtered by that trace_id tell you *what* in full detail. You discover the trace_id, you don't hunt for it.
+
+**Five reproducible use cases:**
+
+1. **"Welcome email never arrived"** — `docker-compose stop celery-worker` then enroll. Mongo events shows the enrollment (request layer worked); welcome-email-consumer logs show `enqueued` (consumer worked); RabbitMQ UI shows the `celery` queue depth > 0 (task waiting); starting celery-worker drains it. Lesson: the pipeline is layered; debugging = find the FIRST broken hop.
+
+2. **"Publish stuck"** — `docker-compose stop worker` then POST /publish. Temporal UI shows workflow `Running` with activity scheduled but never started → worker not polling. `docker-compose start worker` → activity picked up, workflow advances. Lesson: workflow engines visualize stuck state; don't grep logs first.
+
+3. **"Show me everything Alice did today"** — `SELECT id FROM users WHERE email='alice@…';` → `db.events.find({"payload.student_id": "<uuid>"}).sort({archived_at:1})` → chronological event list. Pick one event → `{container="smart-course-api-1"} |= "<event_key>"` in Loki → see the request → click the trace_id → see the waterfall in Jaeger. Lesson: the Mongo `events` collection is the user activity log; Postgres = current state, Mongo = history.
+
+4. **"/enroll is slow"** — Reproduce by 5 concurrent enrolls against the same course (lock contention on SELECT FOR UPDATE). Grafana → Prometheus p95 per handler. Grafana → Jaeger → filter traces `duration > 1s` → open one → see the SELECT FOR UPDATE span dominates. Filter logs by trace_id → confirms lock wait. Lesson: metric → trace → log is the canonical drill-down.
+
+5. **"Duplicate event in the system"** — Reproduce by re-publishing a Kafka message with an existing `event_key` (one-liner from inside the relay container). welcome-email-consumer logs show `duplicate enrollment-…`; Mongo `countDocuments({event_key})` stays at 1; no new welcome email log. Lesson: idempotency + dedupe ledger work silently — when everything's fine, you see nothing happen.
+
+**Practical setup note (encountered live):**
+- Loki/Promtail can be flaky on fresh start (Promtail saw `"at least 1 live replicas required, could only find 0 unhealthy instances"` and held writes). Fix: `docker-compose restart loki promtail`, then wait ~10s for the ingester to come ready. The `label/container/values` endpoint is a quick health check — all 20 containers should appear.
+- In Grafana Explore, the **time picker (top-right)** is the most common reason a Loki query returns empty. Default is often "Last 1 hour"; widen it to "Last 24 hours" or use absolute timestamps before debugging the query itself.
+
+### Q: Why can students not see any lesson content — no text, no video, no link — in the UI?
+
+**A:** Both layers contribute to the gap:
+
+**Backend.** The `lessons` table has `content_type` (video/text/pdf) and `content_url` (external link) — but **no `content_text` column**. Text lessons can only point at a URL, which we flagged earlier as the design flaw to fix (forcing the one natively-text content type through a URL). The seed mock generator created lessons WITHOUT a `content_url` at all — just `{title, order_index, content_type:"text"}` — so there's literally no content reference of any kind.
+
+**Frontend.** `LessonList.tsx` renders title + content_type + duration + an "Open" link *only if* `content_url` is set. So:
+- No URL → just title metadata, nothing to consume.
+- With URL → still just a link out, never an inline render (no embedded YouTube iframe for video, no PDF embed, no markdown render for text).
+
+**Fix (three small chunks):**
+1. Backend: add `content_text TEXT NULL` column (model + schema + Alembic migration); accept it in `LessonCreate`. Lessons of type `text` use this column; `video`/`pdf` continue using `content_url`.
+2. Frontend: a real "lesson player" that switches on `content_type` — text → render `content_text` (markdown-formatted), video → embed YouTube/Vimeo iframe (or `<video>` for direct URLs), pdf → `<iframe>` embed or download card.
+3. Seed: update the mock generator with real content (short markdown body for text lessons; real YouTube tutorial URLs for video lessons; a public PDF URL for pdf lessons).
+
+### Q: For Week 4, what's a chunk, what's an embedding, and how is the data divided?
+
+**A:** Three layers stacked:
+
+**Chunk** = a small piece of source text (200–500 words) that becomes one searchable unit. We chunk instead of storing whole lessons because (1) precision — return the paragraph about replication lag, not the whole lesson; (2) LLM context window — chunks fit in prompts; (3) embedding quality — focused text produces meaningful vectors.
+
+**Embedding** = a list of numbers (a vector — 384 dims for `all-MiniLM-L6-v2`) representing the *meaning* of a piece of text. The model was trained so semantically similar texts produce nearby vectors (small cosine distance). That single property turns "find similar text" into "find nearby vectors" — a SQL `ORDER BY embedding <=> $query_vec LIMIT N` in pgvector. It works for meaning, not keywords: "scaling Postgres" can match a chunk that says "handling high write throughput."
+
+**Data division — three layers top to bottom:**
+- Course (publish event triggers the pipeline)
+- Lesson (one row in `lessons`)
+- Chunks (N rows in `lesson_chunks`, each with FK to the lesson, an `order_index`, and a `vector(384)` column)
+
+Chunks belong to ONE lesson and never span lessons — so retrieval can filter `WHERE course_id = ...` and each result shows "this came from Lesson 1.2." Chunking rule: ~400 tokens per chunk, ~50-token overlap, sentence-boundary-aware. Overlap matters because answers near a chunk boundary would otherwise split in two and lose context.
+
+**The full pipeline (Week 4):**
+
+INGESTION (once, when a course is published, inside the Temporal `process_lessons_activity` we currently have stubbed):
+1. EXTRACT text — text → `content_text` directly; video → faster-whisper transcript; pdf → pypdf
+2. CHUNK — split into ~400-token chunks with overlap
+3. EMBED — `sentence-transformers` produces a 384-d vector per chunk
+4. STORE — bulk INSERT into `lesson_chunks(lesson_id, course_id, chunk_index, text, embedding)`
+
+RETRIEVAL (every search):
+1. Embed the query → query vector
+2. `SELECT text, lesson_id FROM lesson_chunks ORDER BY embedding <=> $vec LIMIT 5`
+3. Return top-K chunks with their lesson context
+
+In Week 5 those chunks feed an LLM prompt for RAG Q&A.
+
+**Where each piece lives:**
+- Raw text source: `lessons.content_text` (text) or fetched from `content_url` (video/pdf)
+- Chunks + embeddings: new `lesson_chunks` table in Postgres with the pgvector extension
+- Chunker: `app/services/chunking_service.py` (pure Python)
+- Embedder: `app/services/embedding_service.py` (wraps sentence-transformers, model loaded once per process)
+- Orchestrator: `app/temporal/activities/course_publish.py` — replace the `process_lessons_activity` stub with extract → chunk → embed → bulk insert
+- Retrieval API: `app/routers/search.py` → `POST /api/v1/search/semantic`
+- UI: a search box on the Course Detail page
+
+**Chunking unit decision: tokens (via `tiktoken`), sentence-boundary aware.** Characters are too crude (split mid-word), word counts are imprecise against LLM context limits, tokens match what the Week 5 LLM cares about. 400 tokens + 50-token overlap is the recommended default.
+
+### Q: How does dual-source lesson content (URL or upload) + the extraction cache work?
+
+**A:** A video/pdf lesson resolves an **effective source**: `storage_key` (uploaded to our object store) wins over `content_url` (external link). Both feed the same chunking + playback machinery. Text lessons use `content_text` inline. Keeping the URL option means no migration pain for existing lessons and matches real LMSs (paste a YouTube link OR upload an MP4).
+
+**Object storage = MinIO (dev) / R2 / S3 (prod).** Same boto3 code; swap is env-vars only. The key Docker subtlety — a presigned URL embeds the host it's signed for:
+- Browser-facing (upload PUT, playback GET) → presigned against the **public** endpoint `localhost:9000`.
+- Worker-facing (download for Whisper/pypdf) → **direct `get_object`** against the **internal** endpoint `minio:9000`, no presign.
+`storage_service.py` keeps two boto3 clients for exactly this.
+
+**Upload flow** (bytes never touch our API): browser → `POST /api/v1/uploads` → presigned PUT URL + `storage_key` → browser PUTs file straight to MinIO → `storage_key` sent in `LessonCreate`. `LessonResponse.playback_url` is a presigned GET (uploads) or the external URL.
+
+**Extraction cache** (`cached_text` + `cached_text_source`): on publish, video/pdf text is memoised on the lesson keyed by a source fingerprint (`storage:<key>` or `url:<url>`). A re-publish with an unchanged source is a **cache hit** — skips Whisper/pypdf entirely. Write-back happens on the ORM object in the activity's session, so it commits with the activity.
+
+**Verified E2E:** uploaded a PDF → presigned PUT (HTTP 200) → lesson with storage_key → playback_url presigned → publish → worker `get_bytes` from MinIO → pypdf extract → 1 chunk in pgvector → `cached_text` populated → re-publish logged `extraction cache hit for lesson=…` (no re-extraction).
+
+**Files:** `storage_service.py`, `routers/uploads.py`, `lesson_service.effective_source/source_fingerprint/playback_url/to_response`, `extraction_service.{extract_pdf_bytes,transcribe_bytes}`, activity `_lesson_text` (cache + storage), migration `7a1c5d9e2f04`, compose `minio` service, frontend `api/uploads.ts` + `ModuleManager` URL/Upload toggle + `LessonPlayer` playback_url.
+
+### Q: What config goes in .env vs YAML? Does Kubernetes have any role locally? What do we maintain for production?
+
+**A:** The governing principle is **12-factor**: code is identical across environments; only config differs. That splits everything into three buckets:
+
+| Bucket | What | Dev location | Prod location |
+|---|---|---|---|
+| Secrets | passwords, API keys, JWT secret | `.env` (gitignored) | secrets manager → k8s Secret |
+| Per-env values | hostnames, endpoints, URLs, toggles | `.env` + compose `environment:` | ConfigMap / Secret |
+| Topology | which services exist, ports, wiring, volumes | `docker-compose.yml` | k8s manifests |
+
+**The test for "env var vs YAML":** *does this value change between laptop / staging / prod?* Yes → env var. No → it's structure, lives in YAML (`ports: 8000`, `image: pgvector/pgvector:pg15`, `worker depends_on kafka`).
+
+**Does k8s run locally? No.** docker-compose IS our local orchestrator. k8s is purely a production concern. You *can* run k8s locally (kind/minikube/k3d) but it adds complexity without teaching anything compose doesn't — skip it for this project. Same Docker image runs in both; only the orchestration layer differs.
+
+**What we maintain for production** (`deploy/k8s/`):
+- Stateful infra (Postgres, Kafka, Redis, RabbitMQ, Mongo, Temporal, object storage, observability) is **managed services in prod, NOT in-cluster** — running stateful systems on k8s is an operational burden managed services solve better. k8s runs only our stateless code.
+- Manifests: `namespace`, `configmap` (non-secret per-env), `secret.example` (template — real one from secrets manager), `migrate-job` (one-shot, gated before rollout), Deployments for api (gunicorn+uvicorn, 3 replicas) / worker / relay / welcome-email-consumer / events-archiver / celery-worker, `api-service`, `ingress` (TLS, only the API is public).
+- Workers scale horizontally safely: Kafka consumer-group partitioning, relay's `FOR UPDATE SKIP LOCKED`, Temporal activity distribution.
+- Not a Helm chart yet — plain manifests are clearer for review; Helm/Kustomize is the next step for multi-env value overrides.
+
+**Config cleanup done this session:** moved the last hardcoded secrets (MinIO `minioadmin`, Grafana `admin`, S3 creds) out of docker-compose into `.env` via `${...}` substitution; rewrote `.env.example` as a documented template with `# CHANGE IN PROD` markers on every secret + managed-endpoint value. Zero hardcoded credentials remain in docker-compose.yml.
+
+### Q: Does video upload actually work end-to-end (Whisper on an uploaded file)?
+
+**A:** Verified. Uploaded a 2.8MB mp4 → presigned PUT to MinIO (HTTP 200) → lesson with storage_key → publish → Temporal worker `get_bytes` from MinIO → ffmpeg decode → faster-whisper ran (`"Processing audio with duration 00:05.759"`). The storage→Whisper path is fully functional. The test clip had no speech (Whisper detected language 'nn' at 0.38 = noise) so produced an empty transcript → 0 chunks, which is *correct* behaviour, not a bug. A separate corrupt 167-byte file was handled gracefully (`"Invalid data found when processing input"` → warning logged, workflow still succeeded). So: upload + storage + extraction + error-handling all proven; a speech-bearing clip would simply yield transcript text → chunks.
+
+### Q: How many k8s "services" did we create, do they need separate AWS instances, and where do managed-service connection variables live?
+
+**A:** Two distinct categories — only the first is in `deploy/k8s/`:
+
+**Category A — our stateless code (6 Deployments + Job + Service + Ingress):** api (3 replicas), worker (2), relay (2), welcome-email-consumer (2), events-archiver (2), celery-worker (2) — 13 pods, all the same image, different commands. **They do NOT each get a server.** k8s bin-packs all 13 pods onto a *shared* EKS node group (~3 EC2 instances, autoscaled). HPAs (`hpa.yaml`) add pods on CPU; the cluster autoscaler adds EC2 nodes when pods don't fit. You never pin a service to an instance.
+
+**Category B — stateful infra (NOT in k8s — managed AWS services):** each IS its own managed service, but AWS runs the underlying instances:
+
+| dev container | AWS managed | own instance? |
+|---|---|---|
+| api/worker/relay/consumers/celery | EKS pods on shared EC2 node group | no — packed |
+| postgres (pgvector) | RDS / Aurora | yes (managed) |
+| kafka | MSK | yes |
+| redis | ElastiCache | yes |
+| rabbitmq | Amazon MQ | yes |
+| mongodb | DocumentDB / Atlas | yes |
+| temporal | Temporal Cloud | external SaaS |
+| minio | S3 (+ CloudFront) | serverless |
+| prometheus/grafana/jaeger/loki | Amazon Managed Prometheus+Grafana / Datadog | managed |
+| frontend | S3 + CloudFront | serverless |
+| ingress | ALB | managed |
+
+**Where managed-service variables live (the key point — yes, we still store them):** AWS runs the service but we must store its endpoint + credentials somewhere the pods read. Flow:
+
+```
+AWS Secrets Manager (source of truth, rotated by AWS)
+   → External Secrets Operator syncs hourly
+   → k8s Secret smartcourse-secrets (auto-created in cluster)
+   → pods envFrom secretRef
+```
+
+Non-secret coordinates (hostnames, bucket) → `configmap.yaml`. Secret parts (full DSNs with creds, keys) → AWS Secrets Manager, pulled in by the ESO `ExternalSecret` (`external-secret.example.yaml`). Auth to AWS uses IRSA — no static keys anywhere. Nothing sensitive is ever committed or hardcoded.
+
+**Cost reality:** the managed-services floor alone is ~$1,100/mo (EKS $73 + nodes ~$200 + RDS ~$140 + MSK ~$250 + ElastiCache/MQ/DocumentDB ~$300 + Temporal/S3/CloudFront/ALB ~$150). This is why the k8s manifests are the *artifact proving the approach*, while docker-compose is what we actually run for the assignment.
+
+### Q: What is Ingress, what do the 14 k8s files do, and why exactly is the k8s-vs-managed split drawn at "state"?
+
+**A:**
+
+**Ingress vs Service** — two different problems:
+- A **Service** (Layer 4) gives a *stable internal address* and load-balances across pods (pods are ephemeral, IPs change, so you can never point at a pod directly). `ClusterIP` = internal only.
+- An **Ingress** (Layer 7 / HTTP) is the *public front door* — TLS termination, hostname + path routing. It's the only internet-facing piece. On AWS it's backed by an ALB.
+- Request path: `browser → Route53 → ALB (Ingress, TLS) → Service (LB) → one api pod`. Node analogy: Ingress ≈ nginx reverse-proxy + TLS; Service ≈ the internal LB it forwards to. Only `api` has a Service+Ingress; the 5 workers reach *out* (to Kafka/DB) so nothing connects *to* them.
+
+**The 14 files by k8s object kind:**
+- Identity/config: `namespace` (isolation boundary), `configmap` (non-secret env), `secret.example` (shape template), `external-secret.example` (real prod: ESO ← AWS Secrets Manager).
+- One-shot: `migrate-job` — a Job runs `alembic upgrade head` to completion then exits (≠ Deployment).
+- Workloads (our code): 6 Deployments (api, worker, relay, welcome-email-consumer, events-archiver, celery-worker) — a Deployment keeps N pods alive, heals + rolls them.
+- Networking: `api-service`, `ingress`.
+- Scaling: `hpa` (6 HorizontalPodAutoscalers).
+
+**Why the split is at STATE:**
+- Stateless (→ k8s): our api/workers hold no data, any replica == any other, kill one → just restart, scale = add identical copies ("cattle").
+- Stateful (→ managed): postgres/kafka/redis/etc. ARE the data, each replica is unique, kill one → data loss risk, scale = resharding ("pets").
+- Stateful is hard in k8s because of: (1) storage identity — pod disks vanish on restart, need StatefulSet+PVC+EBS; (2) cluster quorum — brokers/primaries must re-form leadership without split-brain when pods reschedule; (3) backups/PITR/failover — RDS does it automatically, in k8s you build+test it yourself; (4) upgrades — one click vs a project.
+- You *can* run stateful in k8s via Operators (CloudNativePG, Strimzi) but it needs a platform team + on-call. Rule: don't run stateful in k8s unless operating it is someone's job. We don't, so: stateless → k8s, data → managed.
+- Mental model: **k8s is a scheduler for interchangeable disposable compute — great at healing many identical stateless copies, fighting its nature when babysitting unique precious nodes. Managed services absorb that hard part.** k8s schedules our cattle; AWS tends the pets.
+
+### Q: Is Ingress an AWS service? What AWS compute options exist for our project (we considered EC2)?
+
+**A:** **Ingress is NOT an AWS service — it's a Kubernetes spec.** By itself it does nothing; it needs an Ingress Controller, and on AWS that controller (AWS Load Balancer Controller) provisions an actual **ALB**. So: Ingress = portable k8s abstraction; ALB = the AWS thing implementing it. Same `ingress.yaml` works on any cloud — only the controller underneath changes. (Raw TCP → NLB instead.)
+
+**Compute spectrum for SmartCourse (simplest → most scalable):**
+
+1. **Single EC2 + docker-compose** — one EC2, install Docker, `git pull && docker-compose up -d`. Our exact local setup on a cloud box. Cheapest (~$120/mo for one t3.xlarge), zero new concepts. Cons: single point of failure, no autoscaling, you patch the OS + own backups, data on instance disk. Legitimate for demos/MVPs/this assignment.
+
+2. **ECS / Fargate** — AWS's container orchestrator, no k8s. Fargate = serverless (no EC2 to manage). Container orchestration + autoscaling without learning k8s; AWS-locked (not portable). Sweet spot for many teams.
+
+3. **EKS (managed k8s)** — full k8s, what `deploy/k8s/` targets. Most powerful + complex + expensive (~$1,100/mo floor). Overkill for a learning project.
+
+**Full AWS service map:** compute → EC2/ECS-Fargate/EKS; LB → ALB/NLB; DNS → Route53; Postgres+pgvector → RDS/Aurora; Kafka → MSK; Redis → ElastiCache; RabbitMQ → Amazon MQ; Mongo → DocumentDB/Atlas; Temporal → Temporal Cloud; object storage → S3+CloudFront; frontend → S3+CloudFront; secrets → Secrets Manager; images → ECR; observability → Managed Prometheus+Grafana / CloudWatch / X-Ray; CI/CD → CodePipeline / GitHub Actions; GPU for Whisper → EC2 g4dn/g5 or SageMaker.
+
+**Recommendation:** EC2+docker-compose is the floor (start here — our setup on a cloud box), EKS is the ceiling. The k8s manifests are the "here's how at scale" artifact proving the production end-state, without needing to actually run a $1,100/mo EKS stack. Pick by scale.
+
+### Q: Why do we need RAG if semantic search already works over video/text/pdf? How is it better?
+
+**A:** Semantic search IS the "R" (Retrieval) in RAG — we're already most of the way there. The question is whether the "G" (Generation) earns its place. They answer different questions:
+- Search → "WHERE is this covered?" — returns raw chunks, student interprets them.
+- RAG → "WHAT's the answer?" — feeds the same retrieved chunks to an LLM, returns a synthesized natural-language answer grounded in them.
+
+Same retrieval step; RAG adds an LLM on top.
+
+Concrete (our Sintel data), query "what is the dangerous quest?":
+- Search returns the raw chunk ("...the dangerous quest for unknown unto...") and you figure it out.
+- RAG returns "The dangerous quest refers to the protagonist's search for someone they've lost..." — a direct conversational answer.
+
+4 things RAG does that search can't:
+1. Synthesis — combine 5 chunks into one coherent answer (search returns 5 separate passages).
+2. Natural-language answer to the actual question (vs read+interpret raw text).
+3. Reasoning across chunks — "summarize what this course teaches about X" or "compare flow A vs flow B": no single chunk IS the answer; the LLM generates new text grounded in many. Search physically cannot — it only returns closest existing text.
+4. Conversation — follow-ups.
+
+Why RAG ≠ just ChatGPT: raw ChatGPT knows the world but not YOUR course → hallucinates. Raw search is grounded but dumps text. RAG = an LLM "on a leash" to your content: the prompt forces "answer ONLY from these retrieved chunks; if not there, say you don't know." Combines the LLM's language ability with your data's factual grounding — that's the whole reason the pattern exists.
+
+Honest tradeoff (don't oversell): RAG adds latency (1–5s LLM call vs ~50ms search), cost (an LLM call per query), and a mis-synthesis failure surface. So for navigation ("find the lecture about recursion") plain search is better — instant, free, exact. Real platforms ship BOTH: search for finding pages, RAG for answering questions. We already built the valuable half (retrieval); RAG is a thin layer — wrap retrieved chunks in a prompt, call an LLM, stream the answer (Week 5's deliverable).
+
+### Q: Is RAG free?
+
+**A:** Retrieval half = already free; generation half = free only with a local LLM. RAG has two halves:
+- Retrieval (built): embeddings (sentence-transformers) + pgvector search — all local, $0.
+- Generation (Week 5): the LLM that writes the answer — this is the only new cost.
+
+**Free path — Ollama (local), matches our whisper/embedding choices:** run a small open model (llama3.2:3b ~2GB, phi3.5, qwen2.5:3b — CPU-runnable with 8GB+ RAM; mistral:7b heavier). Free in dollars, but pays in resources: ~3–4GB RAM, CPU pegged while generating, ~5–30s/answer on CPU (streaming hides it), one-time ~2GB download, 3B-quality (good not GPT-4-good). Same trade as Whisper: $0 but slower.
+
+**Paid path — cloud API (comparison):** OpenAI gpt-4o-mini ~$0.15/1M input + $0.60/1M output; a typical RAG query (~2K in, 300 out) = fractions of a cent. Cheap absolutely, but needs a key + sends course content to a third party.
+
+**Recommendation:** Ollama + llama3.2:3b — keeps the whole platform free + self-contained (clone → working RAG, no key, no bill), adds one `ollama` container. Code is identical to the API path, so swap Ollama → OpenAI later with a one-line client change. The one place "free" is noticeably slower: 3B-on-CPU ~10–20s vs cloud ~1s (a GPU makes local both free AND fast). Start free, swap if needed.
+
+### Q: Week 5 — how was the RAG Q&A assistant built and verified?
+
+**A:** RAG = the Week 4 retrieval + an LLM on top. Free/local stack (Ollama), swappable to a cloud API via one module.
+
+Pieces:
+- `services/llm_service.py` — streams chat tokens from Ollama (`/api/chat`, NDJSON); the ONLY LLM-vendor code.
+- `services/rag_service.py` — embed question → `search_repo.search_chunks` (reuses Week 4) scoped to the course → drop chunks below `rag_min_similarity` (0.15) → grounded prompt → stream. If no chunk clears the floor, returns a canned "not covered" message WITHOUT calling the LLM (no hallucination, saves the round trip).
+- `routers/assistant.py` — `POST /api/v1/assistant/ask`, SSE streaming, JSON-encoded tokens (handles markdown newlines), `[DONE]` sentinel.
+- Frontend: `api/assistant.ts` (fetch + SSE reader, JWT attached manually), `AssistantPanel.tsx` (live streaming chat with markdown), wired into the course page beside search.
+- Infra: `ollama` + `ollama-pull` (one-shot model pull) in compose, `ollama_data` volume, `OLLAMA_HOST`/`OLLAMA_MODEL` config, `llama3.2:3b`.
+
+Verified end-to-end against the Sintel course (Whisper transcript of the uploaded video):
+- Q "what is the dangerous quest?" → grounded answer quoting the transcribed dialogue ("dangerous quest for unknown unto…") — full chain video→Whisper→chunk→embed→retrieve→LLM.
+- Q "capital of France?" → "I don't have information about that in this course" — the LLM refused outside knowledge despite obviously knowing it. Grounding leash works.
+
+Gotchas hit: (1) the api container needed recreating to pick up the `OLLAMA_HOST` env added during this work (40h-old container predated the compose edit). (2) First system prompt was too refusal-happy — the 3B model bailed on a short fragmentary transcript; softened it to "treat context as authoritative, answer even if brief; only refuse if nothing related" → grounded answers started working while the off-topic guardrail still held. (3) Ollama image (7.29GB) repeatedly hit `unexpected EOF` on a flaky connection; eventually pulled on retry.
+
+Honest note: llama3.2:3b on CPU is slow (~seconds) and modest quality; streaming hides the latency, and swapping to a cloud API (OpenAI/Anthropic) is a one-file change in `llm_service.py`.
+
+### Q: Search returned the Sintel chunk for "capital of france" at 0% match — bug? Plus: SSE, JSON-encoded tokens, Ollama image vs model, guardrails, seeing the whole flow.
+
+**A:**
+
+**The 0%-match "bug":** that was the SEMANTIC SEARCH panel (not RAG). ANN always returns the *nearest* chunks even when none are relevant, so an off-topic query surfaced the only chunk at ~0%. Fixed: `search_service` now drops hits below `rag_min_similarity` (0.15); irrelevant queries return empty → UI shows "this course doesn't seem to cover it." Verified: "capital of france" → 0 results; "the quest to find someone" → 54% match.
+
+**SSE (Server-Sent Events):** server pushes the response incrementally over one HTTP connection instead of all-at-once. The LLM generates word-by-word; SSE shows words as they're produced (ChatGPT-style) instead of a 10–20s spinner. Format: `data: <chunk>\n\n` lines, ended by `data: [DONE]`.
+
+**JSON-encoded tokens:** SSE uses newlines as frame separators, but LLM output contains newlines/markdown. So each token is `json.dumps()`-wrapped (`data: "line one\nline two"`) so a token's newline can't break the frame; the frontend `JSON.parse`s it back.
+
+**Ollama image vs llama model:** the image (7.29GB) is the *software/server that runs LLMs* (like VLC); the model llama3.2:3b (2GB) is the *trained weights* (like a movie file). One image runs many models. Pulled separately: `docker pull ollama/ollama` (engine) then `ollama pull llama3.2:3b` (content into its volume).
+
+**Guardrails (rag_service):** (1) course scoping — retrieval only searches this course's chunks; (2) similarity floor — sub-0.15 chunks dropped, and if none clear it we return a canned "not covered" WITHOUT calling the LLM (can't hallucinate if it never runs); (3) grounded prompt — "answer ONLY from context, no outside knowledge." That's why "capital of France?" → "I don't have that information" despite the model knowing Paris.
+
+**Seeing the full flow (video→storage→publish→chunk→embed→RAG):** each stage lives in a different tool — MinIO :9001 (uploaded object), Temporal :8080 (publish activities), Loki/Grafana :3000 (worker whisper/chunk logs), Kafka UI :8081 (events), Postgres (lesson_chunks vectors), Prometheus/Grafana (rates/latency), Jaeger :16686 (per-request traces). Honest limitation: tracing is stitched WITHIN the API (one request → its DB spans, shared trace_id) but the async pipeline (publish→Kafka→consumer→worker) produces separate per-service traces — correlate those by `course_id` in Loki. One-trace-across-async needs traceparent propagation through outbox/Kafka headers (documented Week 3 enhancement). To watch live: tail `docker-compose logs -f worker relay events-archiver api`, publish a fresh course, and watch Temporal + Kafka UI + Grafana/Loki + MinIO update in real time.
+
+### Q: Add global semantic search across the user's enrolled courses (not just one course).
+
+**A:** Added `POST /api/v1/search/my` — searches across only the courses the caller may access, derived from their role (the access-control boundary):
+- student → courses they're enrolled in (excludes dropped)
+- instructor → courses they own
+- admin → all courses (no scope filter)
+
+Implementation:
+- `search_repo.search_chunks` gained a `course_ids: list | None` param (IN-filter); empty list short-circuits to no results (avoids degenerate `IN ()`).
+- `search_repo.enrolled_course_ids` / `owned_course_ids` compute the access set.
+- `search_service.global_search` picks the set by role, embeds the query, retrieves, applies the same `rag_min_similarity` floor.
+- Endpoint `/search/my` (any authenticated user); the existing `/search/semantic` (single-course) is unchanged.
+- Frontend: `components/GlobalSearch.tsx` on the Catalog page — each hit links to its course (`course_title · lesson_title`).
+
+Why not earlier / why scoped: a naive "search all lesson_chunks" leaks draft/other-instructors'/non-enrolled content. The fix is filtering retrieval to the user's accessible course set — that's the security boundary. (The RAG assistant stays single-course by design — "ask THIS course" — for relevance/grounding; global search is a different, additive UX.)
+
+Verified: student NOT enrolled → 0 results (no leakage); same student after enrolling in the course → finds the chunk (54% match), scoped to their enrollment.
+
+## Observability use cases (real failure → diagnosis → fix)
+
+### UC1 — "Students aren't getting welcome emails"
+
+**Symptom:** student enrolls, gets HTTP 201, sees the course in My Learning — but no welcome email arrives. (No user-visible error; the request succeeded.)
+
+**Reproduce:** `docker-compose stop celery-worker`, then enroll a student.
+
+**Debug method — walk the pipeline, find the FIRST broken hop:**
+1. **Loki** — `{container="smart-course-welcome-email-consumer-1"} |= "enqueued"` → the consumer DID enqueue the task. So the break is *downstream* of the consumer.
+2. **RabbitMQ management API** (the smoking gun) — `curl -u guest:guest http://localhost:15672/api/queues/%2F/celery` → `1 message waiting, 0 consumers attached`. Messages piling up with **zero consumers** = the worker that drains this queue is gone. **Root cause.**
+   (Or RabbitMQ UI http://localhost:15672 → Queues → `celery` → see depth climbing, consumers = 0.)
+3. **celery-worker logs** — zero `welcome-email` executions in the window → confirms it's not running.
+4. **`docker-compose ps celery-worker`** → `Exited` → confirmed.
+
+**Fix:** `docker-compose start celery-worker`. The queue drains to 0, consumers = 1, and the previously-stuck email fires — proving the task was durably queued in RabbitMQ the whole time (**no data loss**; the work just waited).
+
+**Lesson:** a 201 to the user doesn't mean the whole async pipeline succeeded. The decisive signal here is **queue depth + consumer count** (RabbitMQ), not the API logs. "Messages waiting, 0 consumers" instantly localizes a dead worker. The durability of the broker means recovery = just restart the worker; queued work replays.
+
+### Q: Where is the ALERT? How do we get notified that something is down (not just investigate after noticing)?
+
+**A:** Originally: nowhere. What we'd built (Grafana/Loki/Jaeger/Prometheus) was **observability for investigation** — tools you open *after* you suspect a problem. UC1/UC2 had no alert; we only found issues by looking. Two gaps: (1) no alerting layer; (2) Prometheus only scraped the API — the workers exposed no `/metrics`, so there was no `up{job="celery-worker"}` signal to even alert on.
+
+**Built real alerting (Grafana-managed, panel-only):**
+1. **Worker metrics** — `app/observability/metrics_server.py` runs `prometheus_client.start_http_server(9100)` in each long-running worker (relay, welcome-email-consumer, events-archiver, temporal worker via `_run()`; celery-worker via the `worker_init` signal). Now each worker serves `/metrics`.
+2. **Scrape targets** — `prometheus.yml` gained jobs for relay / welcome-email-consumer / events-archiver / temporal-worker (`worker:9100`) / celery-worker. Verified all 7 targets `up`.
+3. **Alert rules** — `observability/grafana/provisioning/alerting/alerts.yaml`, Grafana-managed:
+   - `SmartCourse service is down` — fires when `up{job=~...} < 1` for 1m (any worker dead).
+   - `SmartCourse API 5xx error rate elevated` — `rate(http_requests_total{status=~"5.."}[5m]) > 0.2` for 2m.
+   Datasource needs a stable uid (`uid: prometheus`) for the rule to reference it.
+4. **No contact point** (panel-only): alerts show in Grafana → Alerting. Add a Slack/email contact point later to get pushed notifications.
+
+**Demonstrated the full lifecycle:** stopped celery-worker → `up=0` within ~10s → alert `pending` for the 1-minute `for:` grace → `firing` at ~72s. Restarted it → `up=1` → alert back to `inactive` within ~36s. This turns UC1/UC2 from "I went and looked" into "Grafana flags it on its own."
+
+**Key concepts:** observability (investigate) ≠ alerting (detect). An alert = a rule evaluated on a timer (`up==0 for 1m`) → fires → routed to a contact point. The `for:` duration is the grace period that avoids flapping on a blip. `up` is Prometheus's built-in per-target scrape-success metric (1=reachable, 0=not) — the simplest, most reliable "is it alive" signal, which is why exposing `/metrics` on every worker was the prerequisite.
+
+### Q: Add Ollama (and everything else without native metrics) to alerting.
+
+**A:** Ollama and the infra (Postgres/Redis/RabbitMQ/Kafka/Mongo/Temporal/MinIO) don't expose Prometheus metrics, so `up`-based alerts couldn't see them — UC4 (Ollama down) was invisible to alerting. Fixed with **blackbox-exporter**, the standard probe-from-outside approach.
+
+- `observability/blackbox.yml` — two modules: `http_2xx` (HTTP GET, success on 2xx) and `tcp_connect` (port accepts a connection).
+- `blackbox-exporter` service in compose (prom/blackbox-exporter), config mounted.
+- `prometheus.yml` — two probe jobs using the standard relabel pattern (Prometheus calls `blackbox-exporter:9115/probe?target=<x>`; the exporter connects to `<x>` and returns `probe_success`; relabel rewrites `instance` = the real target):
+  - `blackbox-http` → `http://ollama:11434/`
+  - `blackbox-tcp` → postgres:5432, redis:6379, rabbitmq:5672, kafka:9092, mongo:27017, temporal:7233, minio:9000
+- Grafana alert `SmartCourse dependency is down` — `probe_success == 0 for 1m`, labelled by `instance` so you see which dependency.
+
+Verified: all 8 probes `up`; stopped Ollama → `probe_success{ollama}=0` → alert `pending` (60s grace) → `firing` (~108s) → restarted → `inactive`. UC4 is now alertable.
+
+**Full alerting coverage now:** our own workers via `up` (Prometheus scrapes their `/metrics` on :9100); Ollama + all infra via `probe_success` (blackbox). Three rules: service-down (workers), dependency-down (Ollama+infra), API-5xx-rate. Concept: `up` = "did Prometheus scrape my /metrics?" (for things that expose metrics); `probe_success` = "could blackbox reach this endpoint?" (for things that don't). Together they cover every component.
+
+### Q: What is a probe / blackbox? How is data gathered for metrics vs logs vs traces?
+
+**A:** **Black-box monitoring** = testing a system from the OUTSIDE, like a user, with no knowledge of internals — you knock and see if it answers. Contrast **white-box** = the app exposes its own internal metrics.
+
+| | White-box | Black-box |
+|---|---|---|
+| How | app exposes /metrics | probe from outside |
+| Knows | internal state (counts, queue depth) | only "is it reachable?" |
+| Ours | api + workers /metrics → scraped | blackbox-exporter → Ollama/infra |
+| Metric | http_requests_total, up | probe_success, probe_duration_seconds |
+
+A **probe** = one outside test (HTTP GET → 2xx? / TCP connect → port open?) reporting `probe_success` 1/0. Used for things that can't report their own metrics (Ollama, databases) — the only knowable fact is "could I reach it?".
+
+**Collection model differs per pillar — the insight is WHO initiates the data movement:**
+- **Metrics = PULL.** Prometheus reaches out and scrapes `/metrics` every 10s (white-box) + scrapes blackbox-exporter for probe results (black-box). Because Prometheus initiates, it instantly knows if a target is unreachable (`up=0`). → stored in Prometheus TSDB → Grafana dashboards + alert rules.
+- **Logs = SHIP.** Each service writes JSON to stdout → Docker json-file → Promtail tails the files and pushes to Loki → Grafana (LogQL). The app just prints; it doesn't know Loki exists.
+- **Traces = PUSH.** The app's OpenTelemetry SDK actively sends spans (OTLP gRPC) to Jaeger as requests happen → Jaeger UI.
+
+Everything funnels into Grafana as the single pane; alert rules sit on the metrics to detect proactively. One-liner: metrics = Prometheus comes to you (pull); logs = an agent ships your stdout (Promtail→Loki); traces = you push spans (→Jaeger).
+
+### UC6 — Events log / analytics stops updating (events-archiver down)
+**Pillar:** Loki logs + service-down alert + Kafka durability.
+**Bug induced:** `docker-compose stop events-archiver` (the Kafka→Mongo consumer). Mongo baseline 378 events.
+**Reproduce:** perform any event-emitting action (enroll / complete lesson).
+**Symptoms / observe:**
+- Mongo `db.events.countDocuments()` stays at 378 — the event log/analytics stops growing.
+- Kafka UI (:8081) → topic `events.user.enrolled` → the new message IS there → event not lost, just not consumed.
+- Grafana → Alerting: "SmartCourse service is down" fires (~1m), labelled events-archiver.
+- Grafana → Loki: `{container="smart-course-events-archiver-1"}` has no recent lines.
+**Fix:** `docker-compose start events-archiver` → rejoins its Kafka **consumer group at the last committed offset**, processes every missed event, Mongo count jumps past 378. **Zero loss** — Kafka held the backlog; consumer resumed exactly where it stopped.
+**Lesson:** a downstream consumer dying causes a *store to stop growing*, not data loss — Kafka is the durable buffer. Detection = service-down alert + stale Loki stream.
+
+### UC5 — Enroll slow under load: metric → trace drill-down (Jaeger)
+**Pillar:** Prometheus p95 (detection) + Jaeger tracing (root cause).
+**Scenario (not a bug — correct behavior under a stampede):** 40 students enroll in one capacity-limited course simultaneously. Enroll does `SELECT course FOR UPDATE` + count + INSERT, so the row lock serializes concurrent enrollers on the same course.
+**Reproduce:** fire 40 concurrent enrolls (5 rounds). p95/max climb vs a single request.
+**Detect (Prometheus/Grafana Explore):**
+`histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{handler=~".*enroll.*"}[1m])) by (le))` → spikes during the burst.
+**Root-cause (Jaeger :16686, service smartcourse-api, the enroll op, Min Duration 50ms):** a ~123ms trace decomposed as: `connect` 23ms (**pool contention** — 40 concurrent > pool_size, requests queue for a connection) + `SELECT … FOR UPDATE` 76ms (**row-lock wait** — blocked on another txn holding the course row) + count 0.7ms + `INSERT` 0.5ms. ~80% of latency is *waiting*, not *working*.
+**The red ⊘ on the INSERT span:** on re-run rounds the student is already enrolled, so INSERT hits `UNIQUE(student_id, course_id)` → IntegrityError → service catches it → **409**. OTel marks the SQL span errored (a *statement* error) but NO 5xx happens (not a *request* error) — so error-rate alerts correctly stay quiet. This is the idempotency-via-DB-constraint guard working, visible one layer deeper than metrics.
+**Lesson:** the histogram gives the number (p95=123ms); the trace names the culprit (76ms lock + 23ms pool wait) → fixes: shrink the locked txn / use atomic `UPDATE … WHERE enrolled < capacity`; raise pool_size. Metrics detect, traces diagnose.
+
+---
+
+## Session — 2026-06-08 (LLM tokens, RAG flow, tok/s, local vs cloud)
+
+### Q: How are LLM tokens produced in SmartCourse? What is the whole `/ask` flow, and what does tok/s depend on?
+
+**A:** A **token** is not something SmartCourse invents — it is a sub-word piece from the **LLM's tokenizer** (roughly ¾ of a word in English). The model reads tokens in (prompt) and writes tokens out (completion). Our app **streams** those output pieces to the browser; Ollama reports the counts on the final `done` JSON line.
+
+**End-to-end flow for `POST /api/v1/assistant/ask`:**
+
+```
+Browser
+  │  SSE stream (one JSON-encoded text chunk per frame)
+  ▼
+assistant router (assistant.py)
+  │  async for token in rag_service.answer_stream(...)
+  ▼
+rag_service.answer_stream
+  ├─ 1. retrieve()
+  │     ├─ embedding_service.embed([question])   ← CPU, ~50ms warm / ~8s cold
+  │     └─ search_repo.search_chunks (pgvector) ← ~10ms
+  ├─ 2. if no hits above similarity floor → canned reply, NO LLM call
+  ├─ 3. build_prompt() — trim chunks to RAG_MAX_CHUNK_TOKENS, assemble context
+  └─ 4. llm_service.stream_chat(system, user_prompt)
+        ├─ POST http://ollama:11434/api/chat  (stream=true)
+        ├─ Ollama phase A: load model (first request after restart)
+        ├─ Ollama phase B: prompt_eval — read ALL input tokens (prefill)
+        ├─ Ollama phase C: eval — generate output tokens one-by-one
+        └─ each streamed line: {"message":{"content":"..."}, "done":false}
+           final line: {"done":true, "prompt_eval_count":N, "eval_count":M, ...}
+```
+
+**Two token counts matter:**
+
+| Kind | Ollama field | What it is | What it depends on |
+|---|---|---|---|
+| **Input / prompt tokens** | `prompt_eval_count` | Everything sent to the model: system prompt + RAG context + question | `RAG_TOP_K`, `RAG_MAX_CHUNK_TOKENS`, chunk text length, system prompt size. **Prefill time scales ~linearly with this.** |
+| **Output / completion tokens** | `eval_count` | Tokens the model **generated** as the answer | Question complexity, how much the model decides to say, `temperature`. Shorter grounded answers → fewer output tokens. |
+
+**Where output tokens are actually created:** inside the **Ollama container** (or a cloud API's GPUs in production). SmartCourse only forwards them. `llm_service.stream_chat` yields `obj["message"]["content"]` per line; the router wraps each chunk in SSE.
+
+**tok/s (tokens per second)** = `eval_count / eval_duration` — output tokens divided by **generation time only** (phase C). It does **not** include prefill (phase B) or TTFT. Recorded in `llm_service._record_completion` and exposed as `llm.ollama.tokens_per_second` on the Jaeger span and on the LLM/RAG Grafana dashboard.
+
+**Why we previously saw ~2 tok/s:** with `llama3.2:3b` running on **CPU inside Docker**, matrix math for autoregressive decoding is slow — ~2–3 output tokens per second is normal. Prefill on a ~2,000-token prompt took **~120–170 s** before any token appeared; generation added another **~30 s** for ~70 tokens. That is a hardware/model-size limit, not a bug in our code.
+
+**After optimization (1b model + smaller prompt):** warm runs showed **~13 tok/s** generation and **~9 s TTFT** — same flow, less work per phase.
+
+**Prometheus metrics tied to tokens:**
+- `smartcourse_llm_prompt_tokens` — histogram of input size
+- `smartcourse_llm_tokens_generated_total` — counter of output tokens
+- `smartcourse_llm_time_to_first_token_seconds` — wall-clock until first streamed chunk (prefill + network)
+- `smartcourse_llm_prompt_eval_seconds` / `smartcourse_llm_eval_seconds` — Ollama's own phase timings
+
+**Grafana:** SmartCourse — LLM / RAG dashboard (`/d/smartcourse-llm-rag`) charts all of the above without writing PromQL by hand.
+
+### Q: If we swap Ollama for OpenAI or Anthropic, why do replies get fast? Does the heavy CPU run there?
+
+**A:** Yes. With Ollama locally, **your machine's CPU** runs the full transformer inference (billions of floating-point ops per token). With OpenAI/Anthropic/Groq, **their GPUs** run it; our API only sends an HTTPS request and streams the response back.
+
+| | Local Ollama (dev) | Cloud API (prod) |
+|---|---|---|
+| **Where inference runs** | Ollama container on your CPU (no GPU in Docker on Mac) | Provider data center on **GPUs** (often thousands of cores / tensor cores) |
+| **What SmartCourse does** | Build RAG prompt → `POST /api/chat` → stream JSON lines | Same orchestration; only `llm_service.py` changes (different HTTP client + auth) |
+| **Typical TTFT** | 10–120+ s on CPU for large prompts | Often **< 1–3 s** |
+| **Typical tok/s** | 2–15 on CPU (model-size dependent) | **50–500+** on GPU-backed APIs |
+| **Cost** | Free, slow | Pay per input + output token |
+
+The RAG pipeline (embed question → pgvector search → build prompt) stays on **our API** in both cases — that part is milliseconds. The speedup from cloud APIs is almost entirely in **phases B and C** (prefill + generation), which move off your laptop onto specialized hardware.
+
+**Production swap is one file:** `backend/app/services/llm_service.py` — swap the Ollama `httpx` stream for the vendor's chat-completions streaming API. `rag_service`, the router, metrics, and Jaeger spans stay the same; you'd map their usage fields to the same `gen_ai.usage.*` attributes.
+
+**Rule of thumb:** input tokens control **how long "thinking…" lasts** (shrink RAG context); output tokens control **how long streaming lasts** (ask for concise answers); **hardware** controls **tok/s** (local CPU slow, cloud GPU fast).
+
+### Q: Are we running a local model? Is our local model actually producing the tokens? (LLM perspective)
+
+**A:** **Yes on both.** SmartCourse does not generate text — **Ollama running `llama3.2:1b` on your machine's CPU** is the only component that produces answer tokens. The API retrieves context, builds a prompt, calls Ollama, and pipes streamed chunks to the browser.
+
+**What runs where (dev stack):**
+
+```
+Your laptop / Docker host
+├── smart-course-api-1        ← SmartCourse (Python/FastAPI)
+│     RAG: embed question, pgvector search, build prompt
+│     llm_service: POST /api/chat, stream response to browser
+│
+└── smart-course-ollama-1     ← Ollama server
+      loads llama3.2:1b weights (~1.3 GB, ollama_data volume)
+      runs the neural network on YOUR CPU
+      ★ produces tokens here ★
+```
+
+- **Model:** `llama3.2:1b` (Meta Llama 3.2, ~1B parameters) — configured in `config.py` / `OLLAMA_MODEL` / docker-compose.
+- **Call site:** `llm_service.stream_chat` → `POST http://ollama:11434/api/chat` with `"stream": true`.
+- **Not the chat LLM:** `sentence-transformers/all-MiniLM-L6-v2` in `embedding_service` only embeds the question for search — it does not write the answer.
+
+**From the LLM's perspective — what happens inside Ollama:**
+
+1. **Tokenize** — system prompt + RAG context + question → integer token IDs (e.g. ~773 input tokens after our RAG tuning). The model never sees raw English.
+
+2. **Prefill (prompt_eval)** — one forward pass over all input tokens; builds internal state ("I've read all this context"). **No output tokens yet** — this is the "thinking…" gap. Slow on CPU; scales with prompt length.
+
+3. **Generate (eval)** — autoregressive loop: predict next token → append → predict next → … until stop:
+   ```
+   [prompt]           → "This"
+   [prompt + "This"]  → " course"
+   [prompt + ...]     → " covers"
+   ...
+   ```
+   Each step is another forward pass through Llama's weights on your CPU. **Every word in the streamed UI is a token (or sub-token) Llama just predicted locally.**
+
+4. **Done frame** — Ollama sends `{"done": true, "prompt_eval_count": N, "eval_count": M, ...}`. SmartCourse records these in metrics/Jaeger; it does not compute them itself.
+
+**Who does what:**
+
+| Layer | Produces answer tokens? |
+|---|---|
+| RAG (`rag_service`) — retrieve + build prompt | No — text assembly only |
+| Embedding model — vector search | No — not the chat LLM |
+| **Ollama / `llama3.2:1b`** | **Yes — the only token producer** |
+| API (`llm_service`, `assistant`) — HTTP + SSE | No — pipe only |
+
+**Analogy:** SmartCourse is the librarian (finds pages, writes the question). Ollama/Llama is the author (writes the answer one word at a time). The librarian delivers; they don't author.
+
+**Verify it's truly local:**
+- `docker exec smart-course-ollama-1 ollama list` → shows `llama3.2:1b` on disk.
+- `docker stop smart-course-ollama-1` → assistant fails (Grafana Ollama probe goes red).
+- Jaeger trace → long span is `POST http://ollama:11434/api/chat`, not an external API.
+- Inference needs no internet once the model is pulled — weights live in the `ollama_data` volume.
+
+**Local vs cloud — same LLM mechanics, different hardware:**
+
+| | Now (local) | Prod (OpenAI/Anthropic) |
+|---|---|---|
+| Who produces tokens | Llama in Ollama on your CPU | Their model on their GPUs |
+| SmartCourse's job | Build prompt, stream response | Identical — only `llm_service.py` changes |
+| Speed limiter | Your CPU + model size | Their GPU infra |
+
+**One-liner:** `llama3.2:1b` inside Ollama reads the RAG prompt and generates every answer token on your machine; SmartCourse retrieves context, sends the prompt, and forwards the stream.

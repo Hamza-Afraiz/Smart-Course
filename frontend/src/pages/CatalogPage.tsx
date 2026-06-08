@@ -6,6 +6,7 @@ import { errorMessage } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import type { Course } from "../api/types";
 import { EmptyState, ErrorBanner, Spinner } from "../components/ui";
+import GlobalSearch from "../components/GlobalSearch";
 
 export default function CatalogPage() {
   const { user } = useAuth();
@@ -49,6 +50,8 @@ export default function CatalogPage() {
       </div>
 
       <ErrorBanner message={error} />
+
+      <GlobalSearch />
 
       {courses.length === 0 ? (
         <EmptyState>

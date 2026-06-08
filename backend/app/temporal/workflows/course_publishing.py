@@ -27,7 +27,11 @@ class CoursePublishingWorkflow:
             await workflow.execute_activity(
                 "process_lessons_activity",
                 args=[course_id, key2],
-                start_to_close_timeout=timedelta(seconds=120),
+                # Bumped for Week 4: chunking + embedding many lessons can take
+                # longer than the validate/mark activities. The work is CPU-
+                # bound (sentence-transformers on CPU); 5 min is generous head-
+                # room for a course with dozens of lessons.
+                start_to_close_timeout=timedelta(seconds=300),
             )
             step2_complete = True
             await workflow.execute_activity(

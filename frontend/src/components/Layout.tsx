@@ -26,6 +26,9 @@ export default function Layout() {
             {(user?.role === "instructor" || user?.role === "admin") && (
               <NavLink to="/my-courses">My Courses</NavLink>
             )}
+            {user?.role === "admin" && (
+              <NavLink to="/admin/metrics">Metrics</NavLink>
+            )}
             <NavLink to="/profile">Profile</NavLink>
           </nav>
 

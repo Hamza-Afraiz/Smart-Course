@@ -1,0 +1,45 @@
+# FastAPI API. Production server model: gunicorn process manager + uvicorn
+# workers (per CLAUDE.md). Stateless → scales horizontally behind the Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smartcourse-api
+  namespace: smartcourse
+  labels: { app: smartcourse-api }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: smartcourse-api }
+  template:
+    metadata:
+      labels: { app: smartcourse-api }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
+    spec:
+      containers:
+        - name: api
+          image: REGISTRY/smart-course-app:TAG
+          command:
+            - gunicorn
+            - app.main:app
+            - --workers=4
+            - --worker-class=uvicorn.workers.UvicornWorker
+            - --bind=0.0.0.0:8000
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef: { name: smartcourse-config }
+            - secretRef:    { name: smartcourse-secrets }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }

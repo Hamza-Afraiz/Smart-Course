@@ -1,0 +1,26 @@
+# Outbox relay — drains the Postgres `outbox` into Kafka. Scales horizontally:
+# FOR UPDATE SKIP LOCKED means N replicas never double-send.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smartcourse-relay
+  namespace: smartcourse
+  labels: { app: smartcourse-relay }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: smartcourse-relay }
+  template:
+    metadata:
+      labels: { app: smartcourse-relay }
+    spec:
+      containers:
+        - name: relay
+          image: REGISTRY/smart-course-app:TAG
+          command: ["python", "-m", "app.workers.outbox_relay"]
+          envFrom:
+            - configMapRef: { name: smartcourse-config }
+            - secretRef:    { name: smartcourse-secrets }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }

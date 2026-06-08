@@ -2,8 +2,8 @@
 
 Single source of truth for what's done and what's next across all 5 weeks. Update this doc whenever a milestone moves.
 
-**Last updated:** 2026-05-22
-**Current focus:** Week 3 essentially complete — event-driven (outbox → Kafka → consumers → Celery), Mongo event log, analytics endpoints, and full observability (Prometheus metrics + Grafana, structured JSON logs, OpenTelemetry → Jaeger tracing). Part A done; Week 4 (embeddings/pgvector) next.
+**Last updated:** 2026-06-05
+**Current focus:** ALL 5 WEEKS COMPLETE. Part A (foundation, enrollment+Temporal, event-driven+observability) + Part B (Week 4 retrieval: chunking/embeddings/pgvector over text+pdf+video; Week 5 RAG Q&A via Ollama) done. Plus: React UI, dual-source media (URL + MinIO upload), extraction cache, prod k8s manifests + HPA + ExternalSecret.
 
 ---
 
@@ -135,7 +135,22 @@ Single source of truth for what's done and what's next across all 5 weeks. Updat
 
 ## Part B — GenAI Layer (Weeks 4–5)
 
-### 🟣 Week 4 — Retrieval Layer — ⬜ NOT STARTED
+### 🟣 Week 4 — Retrieval Layer — ✅ COMPLETE
+
+| Item | Status | Notes |
+|---|---|---|
+| pgvector + `lesson_chunks` table (vector(384), HNSW) | ✅ | `pgvector/pgvector:pg15` image |
+| Chunking (tiktoken, sentence-aware, ~400 tok + overlap) | ✅ | `chunking_service.py` |
+| Embeddings (sentence-transformers all-MiniLM-L6-v2, local/free) | ✅ | `embedding_service.py`, warm-up at worker start |
+| Extraction: text inline, pdf (pypdf), video (faster-whisper / YouTube) | ✅ | `extraction_service.py`; URL + uploaded-file paths |
+| Wired into Temporal `process_lessons_activity` (replaced stub) | ✅ | extract → chunk → embed → bulk insert; idempotent |
+| Semantic search endpoint `POST /search/semantic` | ✅ | cosine `<=>`, course-scoped |
+| Dual-source media (paste URL OR upload to MinIO) + extraction cache | ✅ | bonus beyond plan |
+| Verified: video upload → Whisper transcript → chunk → semantic match | ✅ | Sintel: "guards the land" matched "gatekeepers" with no shared words |
+
+### 🔵 Week 4 (original heading retained below) — superseded by the table above
+
+### 🟣 Week 4 — Retrieval Layer — (legacy checklist) — ⬜ NOT STARTED
 
 | Item | Status | Notes |
 |---|---|---|
@@ -154,7 +169,20 @@ Single source of truth for what's done and what's next across all 5 weeks. Updat
 
 ---
 
-### 🔵 Week 5 — AI Assistant — ⬜ NOT STARTED
+### 🔵 Week 5 — AI Assistant — ✅ COMPLETE
+
+| Item | Status | Notes |
+|---|---|---|
+| RAG Q&A endpoint `POST /assistant/ask` (SSE streaming) | ✅ | `routers/assistant.py` |
+| Retrieval reuses Week 4 search, course-scoped + similarity floor | ✅ | `rag_service.py` |
+| LLM via Ollama (llama3.2:3b, local/free) | ✅ | `llm_service.py`; swap to API = one file |
+| Grounded prompt + hallucination guardrail | ✅ | answers only from chunks; off-topic → "not in this course" (no LLM call when no hits) |
+| Streaming chat UI on course page | ✅ | `AssistantPanel.tsx` + `api/assistant.ts` (fetch SSE reader) |
+| Verified grounded answer + guardrail | ✅ | Sintel transcript answered; "capital of France?" refused |
+
+**Note:** instructor content generation (summaries/quizzes) from the original plan is the same RAG pattern with a different prompt — not built, optional extension.
+
+### 🔵 Week 5 — AI Assistant — (legacy checklist) — ⬜ NOT STARTED
 
 | Item | Status | Notes |
 |---|---|---|

@@ -46,4 +46,22 @@ opentelemetry-sdk==1.27.0                          # tracer provider + span proc
 opentelemetry-exporter-otlp-proto-grpc==1.27.0     # ship spans to Jaeger over OTLP/gRPC (:4317)
 opentelemetry-instrumentation-fastapi==0.48b0      # auto spans for HTTP requests
 opentelemetry-instrumentation-sqlalchemy==0.48b0   # auto child spans for DB queries
+opentelemetry-instrumentation-httpx==0.48b0        # auto spans for outbound httpx (Ollama LLM call)
 opentelemetry-instrumentation-logging==0.48b0      # inject trace_id/span_id into log records
+
+# ── Week 4 — Retrieval layer (chunking + embeddings + pgvector) ───────────────
+# torch from the PyTorch CPU-only index — much smaller than the default CUDA build.
+# Pin it explicitly so pip doesn't try to resolve the GPU wheel.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+pgvector==0.3.6                # SQLAlchemy Vector column type + the `<=>` operator helpers
+tiktoken==0.8.0                # OpenAI tokenizer — counts tokens for sentence-aware chunking
+sentence-transformers==3.3.1   # all-MiniLM-L6-v2 (384-dim) — local CPU embedding, no API key
+
+# ── Week 4 — Content extraction (video transcripts + PDF text) ────────────────
+pypdf==5.1.0                   # pure-Python PDF text extraction
+youtube-transcript-api==0.6.3  # YouTube captions — best when it works; YouTube blocks cloud IPs
+faster-whisper==1.1.0          # local CPU Whisper for direct video URLs (tiny model, ~39MB)
+
+# ── Week 4 — Object storage (MinIO in dev, R2/S3 in prod) ─────────────────────
+boto3==1.35.71                 # S3-compatible client: presigned upload/playback URLs + get_object

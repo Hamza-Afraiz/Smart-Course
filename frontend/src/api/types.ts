@@ -48,9 +48,19 @@ export interface Lesson {
   order_index: number;
   content_type: ContentType | null;
   content_url: string | null;
+  content_text: string | null;
+  storage_key: string | null;
+  mime_type: string | null;
+  // Resolved by the backend: presigned GET when uploaded, else content_url.
+  playback_url: string | null;
   duration_seconds: number | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface UploadUrlResponse {
+  upload_url: string;
+  storage_key: string;
 }
 
 export interface ProgressSummary {
@@ -87,4 +97,70 @@ export interface PublishAccepted {
 export interface PublishStatus {
   workflow_id: string;
   status: string;
+}
+
+// ── Admin / Metrics ──────────────────────────────────────────────────────────
+
+export interface OverviewMetrics {
+  total_students: number;
+  total_instructors: number;
+  total_courses_published: number;
+  total_courses_draft: number;
+  total_courses_archived: number;
+  total_enrollments: number;
+  avg_courses_per_student: number;
+}
+
+export interface CompletionMetrics {
+  completion_rate: number;
+  avg_completion_seconds: number | null;
+  completed_enrollments: number;
+  active_enrollments: number;
+}
+
+export interface PopularCourse {
+  course_id: string;
+  title: string;
+  enrollment_count: number;
+}
+
+export interface PopularCourses {
+  courses: PopularCourse[];
+}
+
+export interface DayBucket {
+  date: string; // YYYY-MM-DD
+  count: number;
+}
+
+export interface EnrollmentsTimeSeries {
+  series: DayBucket[];
+}
+
+export interface RecentActivityItem {
+  event_type: string;
+  event_key: string;
+  archived_at: string;
+  payload: Record<string, unknown>;
+}
+
+export interface RecentActivity {
+  items: RecentActivityItem[];
+}
+
+// ── Semantic search (Week 4) ─────────────────────────────────────────────────
+
+export interface SearchHit {
+  lesson_id: string;
+  lesson_title: string;
+  course_id: string;
+  course_title: string;
+  chunk_index: number;
+  text: string;
+  similarity: number; // 0.0–1.0
+}
+
+export interface SearchResponse {
+  query: string;
+  results: SearchHit[];
 }

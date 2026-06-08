@@ -1,0 +1,559 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "LLM requests / sec (5m)",
+      "description": "Rate of chat completions reaching the LLM (success, error, or cancelled).",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(smartcourse_llm_requests_total[5m]))", "refId": "A" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 4 } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total LLM requests",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(smartcourse_llm_requests_total)", "refId": "A" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Avg TTFT (s)",
+      "description": "Time-to-first-token — wall-clock silence before the answer starts streaming. This is what the user feels.",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(smartcourse_llm_time_to_first_token_seconds_sum) / clamp_min(sum(smartcourse_llm_time_to_first_token_seconds_count), 1)",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 60 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Avg prompt tokens",
+      "description": "Prompt length in tokens (Ollama prompt_eval_count). Longer prompts → longer prefill on CPU.",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(smartcourse_llm_prompt_tokens_sum) / clamp_min(sum(smartcourse_llm_prompt_tokens_count), 1)",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 } }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Throughput (tok/s)",
+      "description": "Output tokens per second during generation (eval phase only).",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(smartcourse_llm_tokens_generated_total[5m])) / clamp_min(sum(rate(smartcourse_llm_eval_seconds_sum[5m])), 0.001)",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 2 } }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Error / cancelled rate (5m)",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(smartcourse_llm_requests_total{outcome!=\"success\"}[5m])) / clamp_min(sum(rate(smartcourse_llm_requests_total[5m])), 0.0001)",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      }
+    },
+
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Timing breakdown (averages)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Avg wall-clock (s)",
+      "description": "Full streamed completion time — retrieval done, LLM finished.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (smartcourse_llm_generation_seconds_sum) / clamp_min(sum by (model) (smartcourse_llm_generation_seconds_count), 1)",
+          "refId": "A",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 1 } }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Avg prefill / prompt-eval (s)",
+      "description": "Ollama prompt_eval_duration — model reading the RAG context before token 1. Usually the dominant slice on CPU.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (smartcourse_llm_prompt_eval_seconds_sum) / clamp_min(sum by (model) (smartcourse_llm_prompt_eval_seconds_count), 1)",
+          "refId": "A",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "red", "value": 120 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Avg token generation (s)",
+      "description": "Ollama eval_duration — time spent generating output tokens after prefill.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (smartcourse_llm_eval_seconds_sum) / clamp_min(sum by (model) (smartcourse_llm_eval_seconds_count), 1)",
+          "refId": "A",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 1 } }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Prefill vs generation (avg, s)",
+      "description": "Side-by-side view of where LLM time goes. If prefill ≫ generation, shrink RAG context.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (smartcourse_llm_prompt_eval_seconds_sum) / clamp_min(sum by (model) (smartcourse_llm_prompt_eval_seconds_count), 1)",
+          "refId": "A",
+          "legendFormat": "prefill {{model}}"
+        },
+        {
+          "expr": "sum by (model) (smartcourse_llm_eval_seconds_sum) / clamp_min(sum by (model) (smartcourse_llm_eval_seconds_count), 1)",
+          "refId": "B",
+          "legendFormat": "generation {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Histograms — time to first token",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "TTFT — p50 / p95 / p99 (s)",
+      "description": "smartcourse_llm_time_to_first_token_seconds — user-perceived wait before streaming starts.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(smartcourse_llm_time_to_first_token_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "p50 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(smartcourse_llm_time_to_first_token_seconds_bucket[5m])))",
+          "refId": "B",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smartcourse_llm_time_to_first_token_seconds_bucket[5m])))",
+          "refId": "C",
+          "legendFormat": "p99 {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "TTFT — average (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(smartcourse_llm_time_to_first_token_seconds_sum[5m])) / clamp_min(sum by (model) (rate(smartcourse_llm_time_to_first_token_seconds_count[5m])), 0.0001)",
+          "refId": "A",
+          "legendFormat": "avg {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Histograms — wall-clock generation",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 },
+      "collapsed": false
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Generation wall-clock — p50 / p95 / p99 (s)",
+      "description": "smartcourse_llm_generation_seconds — full streamed completion from first byte to done frame.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(smartcourse_llm_generation_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "p50 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(smartcourse_llm_generation_seconds_bucket[5m])))",
+          "refId": "B",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smartcourse_llm_generation_seconds_bucket[5m])))",
+          "refId": "C",
+          "legendFormat": "p99 {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Generation wall-clock — average (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(smartcourse_llm_generation_seconds_sum[5m])) / clamp_min(sum by (model) (rate(smartcourse_llm_generation_seconds_count[5m])), 0.0001)",
+          "refId": "A",
+          "legendFormat": "avg {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 104,
+      "type": "row",
+      "title": "Histograms — prefill (prompt eval)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
+      "collapsed": false
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Prompt eval (prefill) — p50 / p95 / p99 (s)",
+      "description": "smartcourse_llm_prompt_eval_seconds — Ollama reading the prompt. The 'thinking…' gap.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(smartcourse_llm_prompt_eval_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "p50 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(smartcourse_llm_prompt_eval_seconds_bucket[5m])))",
+          "refId": "B",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smartcourse_llm_prompt_eval_seconds_bucket[5m])))",
+          "refId": "C",
+          "legendFormat": "p99 {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Prompt eval (prefill) — average (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(smartcourse_llm_prompt_eval_seconds_sum[5m])) / clamp_min(sum by (model) (rate(smartcourse_llm_prompt_eval_seconds_count[5m])), 0.0001)",
+          "refId": "A",
+          "legendFormat": "avg {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 105,
+      "type": "row",
+      "title": "Histograms — token generation (eval)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "collapsed": false
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Token generation (eval) — p50 / p95 / p99 (s)",
+      "description": "smartcourse_llm_eval_seconds — Ollama generating output tokens after prefill.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(smartcourse_llm_eval_seconds_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "p50 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(smartcourse_llm_eval_seconds_bucket[5m])))",
+          "refId": "B",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smartcourse_llm_eval_seconds_bucket[5m])))",
+          "refId": "C",
+          "legendFormat": "p99 {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Token generation (eval) — average (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(smartcourse_llm_eval_seconds_sum[5m])) / clamp_min(sum by (model) (rate(smartcourse_llm_eval_seconds_count[5m])), 0.0001)",
+          "refId": "A",
+          "legendFormat": "avg {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 106,
+      "type": "row",
+      "title": "Histograms — prompt size (tokens)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "collapsed": false
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Prompt tokens — p50 / p95 / p99",
+      "description": "smartcourse_llm_prompt_tokens — input size sent to the model. Correlate with prefill time.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(smartcourse_llm_prompt_tokens_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "p50 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(smartcourse_llm_prompt_tokens_bucket[5m])))",
+          "refId": "B",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smartcourse_llm_prompt_tokens_bucket[5m])))",
+          "refId": "C",
+          "legendFormat": "p99 {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 } }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Prompt tokens — average",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(smartcourse_llm_prompt_tokens_sum[5m])) / clamp_min(sum by (model) (rate(smartcourse_llm_prompt_tokens_count[5m])), 0.0001)",
+          "refId": "A",
+          "legendFormat": "avg {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 } }
+    },
+
+    {
+      "id": 107,
+      "type": "row",
+      "title": "Counters & throughput",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "collapsed": false
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "LLM requests by outcome (rate / sec)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (outcome, model) (rate(smartcourse_llm_requests_total[5m]))",
+          "refId": "A",
+          "legendFormat": "{{outcome}} {{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Output tokens generated (rate / sec)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(smartcourse_llm_tokens_generated_total[5m]))",
+          "refId": "A",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Generation throughput (tok/s)",
+      "description": "rate(tokens_generated) / rate(eval_seconds_sum) — effective decode speed during the eval phase.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 66 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(smartcourse_llm_tokens_generated_total[5m])) / clamp_min(sum by (model) (rate(smartcourse_llm_eval_seconds_sum[5m])), 0.001)",
+          "refId": "A",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 2 } }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["smartcourse", "llm", "rag"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "SmartCourse — LLM / RAG",
+  "uid": "smartcourse-llm-rag",
+  "version": 1,
+  "weekStart": ""
+}

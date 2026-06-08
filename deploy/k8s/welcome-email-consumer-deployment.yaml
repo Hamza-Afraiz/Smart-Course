@@ -1,0 +1,26 @@
+# Kafka → Celery bridge for events.user.enrolled. Dedupes via processed_events,
+# enqueues the welcome-email task. Scales by Kafka consumer-group partitioning.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smartcourse-welcome-email-consumer
+  namespace: smartcourse
+  labels: { app: smartcourse-welcome-email-consumer }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: smartcourse-welcome-email-consumer }
+  template:
+    metadata:
+      labels: { app: smartcourse-welcome-email-consumer }
+    spec:
+      containers:
+        - name: consumer
+          image: REGISTRY/smart-course-app:TAG
+          command: ["python", "-m", "app.workers.welcome_email_consumer"]
+          envFrom:
+            - configMapRef: { name: smartcourse-config }
+            - secretRef:    { name: smartcourse-secrets }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }

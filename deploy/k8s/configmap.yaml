@@ -1,0 +1,24 @@
+# Non-secret, per-environment configuration. Hostnames here point at the
+# MANAGED services (RDS, MSK, Atlas, …) — replace with your real endpoints.
+# Anything sensitive (passwords, keys, full DSNs with creds) goes in the Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smartcourse-config
+  namespace: smartcourse
+data:
+  APP_ENV: "production"
+  ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+
+  # Managed-service endpoints (no credentials here — those live in the Secret's
+  # full connection strings). These are the non-secret coordinates.
+  TEMPORAL_HOST: "temporal.example-managed:7233"
+  KAFKA_BOOTSTRAP_SERVERS: "b-1.msk.example:9092,b-2.msk.example:9092"
+  MONGO_DB: "smartcourse"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability:4317"
+
+  # Object storage (R2/S3). In prod both endpoints are the cloud URL; the
+  # browser uses a CDN-fronted public URL for playback.
+  S3_BUCKET: "smartcourse-media-prod"
+  S3_INTERNAL_ENDPOINT: "https://s3.us-east-1.amazonaws.com"
+  S3_PUBLIC_ENDPOINT: "https://media.smartcourse.example"

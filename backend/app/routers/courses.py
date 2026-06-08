@@ -255,7 +255,7 @@ async def add_lesson(
     db: DBSession,
 ) -> LessonResponse:
     try:
-        return await lesson_service.create(
+        lesson = await lesson_service.create(
             db,
             course_id=course_id,
             module_id=module_id,
@@ -264,8 +264,13 @@ async def add_lesson(
             order_index=payload.order_index,
             content_type=payload.content_type,
             content_url=payload.content_url,
+            content_text=payload.content_text,
+            storage_key=payload.storage_key,
+            mime_type=payload.mime_type,
+            file_size=payload.file_size,
             duration_seconds=payload.duration_seconds,
         )
+        return lesson_service.to_response(lesson)
     except CourseNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
     except ModuleNotFoundError:
@@ -287,9 +292,10 @@ async def list_lessons(
     db: DBSession,
 ) -> list[LessonResponse]:
     try:
-        return await lesson_service.list_for_module(
+        lessons = await lesson_service.list_for_module(
             db, course_id=course_id, module_id=module_id, viewer=current_user
         )
+        return [lesson_service.to_response(l) for l in lessons]
     except CourseNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
     except ModuleNotFoundError:

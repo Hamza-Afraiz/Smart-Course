@@ -69,6 +69,10 @@ export async function createLesson(
     order_index: number;
     content_type?: string;
     content_url?: string;
+    content_text?: string;
+    storage_key?: string;
+    mime_type?: string;
+    file_size?: number;
     duration_seconds?: number;
   },
 ): Promise<Lesson> {

@@ -15,6 +15,7 @@ from app.observability.logging import configure_json_logging
 from app.observability.tracing import (
     configure_tracing,
     instrument_fastapi,
+    instrument_httpx,
     instrument_sqlalchemy,
 )
 
@@ -22,6 +23,7 @@ from app.observability.tracing import (
 configure_json_logging(service_name="api")
 configure_tracing(service_name="api")
 instrument_sqlalchemy(engine)
+instrument_httpx()  # trace outbound calls (Ollama LLM) — see the gap in Jaeger
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +39,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Temporal unavailable — publish will return 503: %s", e)
         app.state.temporal_client = None
+
+    # Ensure the object-storage bucket exists for uploads
+    try:
+        from app.services import storage_service
+
+        await asyncio.to_thread(storage_service.ensure_bucket)
+    except Exception as e:
+        logger.warning("object storage unavailable — uploads will fail: %s", e)
+
     yield
     await engine.dispose()
     logger.info("SmartCourse API shut down — connections closed")
@@ -89,10 +100,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 
+from app.routers.assistant import router as assistant_router
 from app.routers.auth import router as auth_router
 from app.routers.courses import router as courses_router
 from app.routers.enrollments import router as enrollments_router
 from app.routers.metrics import router as metrics_router
+from app.routers.search import router as search_router
+from app.routers.uploads import router as uploads_router
 from app.routers.users import router as users_router
 
 app.include_router(auth_router, prefix="/api/v1/auth")
@@ -100,6 +114,9 @@ app.include_router(users_router, prefix="/api/v1/users")
 app.include_router(courses_router, prefix="/api/v1/courses")
 app.include_router(enrollments_router, prefix="/api/v1/enrollments")
 app.include_router(metrics_router, prefix="/api/v1/admin/metrics")
+app.include_router(search_router, prefix="/api/v1/search")
+app.include_router(uploads_router, prefix="/api/v1/uploads")
+app.include_router(assistant_router, prefix="/api/v1/assistant")
 
 # ── Health Check ──────────────────────────────────────────────────────────────
 

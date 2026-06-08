@@ -8,6 +8,7 @@ import CourseDetailPage from "./pages/CourseDetailPage";
 import MyCoursesPage from "./pages/MyCoursesPage";
 import MyEnrollmentsPage from "./pages/MyEnrollmentsPage";
 import ProfilePage from "./pages/ProfilePage";
+import AdminMetricsPage from "./pages/AdminMetricsPage";
 
 export default function App() {
   return (
@@ -41,6 +42,14 @@ export default function App() {
           }
         />
         <Route path="/profile" element={<ProfilePage />} />
+        <Route
+          path="/admin/metrics"
+          element={
+            <ProtectedRoute roles={["admin"]}>
+              <AdminMetricsPage />
+            </ProtectedRoute>
+          }
+        />
       </Route>
 
       <Route path="/" element={<Navigate to="/courses" replace />} />

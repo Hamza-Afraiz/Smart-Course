@@ -10,7 +10,7 @@ are declared in `app.tasks.*` and auto-discovered via `include=`.
 """
 
 from celery import Celery
-from celery.signals import setup_logging
+from celery.signals import setup_logging, worker_init
 
 from app.config import settings
 
@@ -22,6 +22,14 @@ def _configure_celery_logging(**_kwargs):
     from app.observability.tracing import configure_tracing
     configure_json_logging(service_name="celery-worker")
     configure_tracing(service_name="celery-worker")
+
+
+@worker_init.connect
+def _start_metrics(**_kwargs):
+    """Expose /metrics from the worker's main process so Prometheus sees
+    up{job="celery-worker"}."""
+    from app.observability.metrics_server import start_metrics_server
+    start_metrics_server()
 
 
 celery_app = Celery(

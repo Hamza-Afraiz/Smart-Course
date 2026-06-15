@@ -3,6 +3,7 @@ import type {
   CompletionMetrics,
   EnrollmentsTimeSeries,
   OverviewMetrics,
+  PipelineHealth,
   PopularCourses,
   RecentActivity,
 } from "./types";
@@ -36,5 +37,10 @@ export async function getRecentActivity(limit = 20): Promise<RecentActivity> {
   const { data } = await api.get<RecentActivity>("/admin/metrics/recent-activity", {
     params: { limit },
   });
+  return data;
+}
+
+export async function getPipelineHealth(): Promise<PipelineHealth> {
+  const { data } = await api.get<PipelineHealth>("/admin/metrics/pipeline-health");
   return data;
 }

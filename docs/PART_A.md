@@ -187,10 +187,12 @@ Cross-reference between the original spec and what we've built so far. Update as
 | Enrollment Workflow — recorded + duplicate prevention + capacity | ✅ Week 2 Chunk A | [app/services/enrollment_service.py](../app/services/enrollment_service.py) (race-safe via `SELECT FOR UPDATE`) |
 | Enrollment Workflow — progress tracking initialized | ✅ Week 2 Chunk A | Progress rows created on lesson completion; auto-completes enrollment when all lessons done |
 | Enrollment Workflow — idempotency | ✅ Week 2 Chunk A | DB UNIQUE constraints on `(student_id, course_id)` and `(enrollment_id, lesson_id)` |
-| Enrollment Workflow — analytics updates, notifications | ⬜ Week 3 | Will be async via Kafka + Celery (see [CLAUDE.md](../CLAUDE.md) sync vs async boundary) |
-| Content Publishing Workflow — multi-step, partial-failure safe | ⬜ Week 2 Chunk B | Temporal workflow + compensations — playbook in [CLAUDE.md](../CLAUDE.md) Saga section |
-| Distributed & Event-Driven Behaviors — Kafka events, Celery consumers | ⬜ Week 3 | Transactional outbox + idempotent consumers (see [docs/QA.md](QA.md) Session 3) |
-| Analytics Metrics | ⬜ Week 3 | Eventual-consistency model; reconciliation job for drift recovery |
-| System Observability — Prometheus, Jaeger, OpenTelemetry | ⬜ Week 3 | |
+| Enrollment Workflow — analytics updates, notifications | ✅ Week 3 | Outbox + Kafka + Celery welcome-email stub |
+| Content Publishing Workflow — multi-step, partial-failure safe | ✅ Week 2 Chunk B | Temporal workflow + compensations — [CLAUDE.md](../CLAUDE.md) Saga section |
+| Distributed & Event-Driven Behaviors — Kafka events, Celery consumers | ✅ Week 3 | Transactional outbox + idempotent consumers (see [docs/QA.md](QA.md)) |
+| Analytics Metrics | ✅ Week 3 | `GET /admin/metrics/*` — Postgres rollups + Mongo event log |
+| System Observability — Prometheus, Jaeger, OpenTelemetry | ✅ Week 3 | `/metrics`, Grafana dashboards, OTel spans incl. LLM/RAG |
+| Retrieval & semantic search (Part B) | ✅ Week 4 | pgvector, chunking, embeddings, `POST /search/*` |
+| RAG Q&A + instructor content generation (Part B) | ✅ Week 5 | `POST /assistant/ask`, `POST /assistant/generate` |
 
 For the formal **use-cases, NFRs, milestones, and requirement-to-test traceability matrix**, see [PRD.md](PRD.md) (sections *Key Use-Cases*, *Non-Functional Requirements*, *Milestones & Deliverable Traceability*, and *Requirement traceability matrix*).

@@ -3221,3 +3221,202 @@ Your laptop / Docker host
 | Speed limiter | Your CPU + model size | Their GPU infra |
 
 **One-liner:** `llama3.2:1b` inside Ollama reads the RAG prompt and generates every answer token on your machine; SmartCourse retrieves context, sends the prompt, and forwards the stream.
+
+### Q: How does instructor summary/quiz generation work?
+
+Same RAG pipeline as student Q&A, different prompts and auth:
+
+1. **Auth** — `POST /assistant/generate` requires instructor (or admin) and course ownership. Ownership is validated *before* the SSE stream starts so 403/404 return as normal HTTP errors.
+2. **Context** — If `lesson_id` is set, all indexed chunks for that lesson are loaded. If omitted, semantic retrieval over the whole course (same embedding + pgvector path as search).
+3. **Generation** — `kind: "summary"` uses a bullet-point instructor prompt (`temperature=0.2`); `kind: "quiz"` uses a strict markdown template with numbered questions, A–D options, correct answer, and explanation (`temperature=0.1`).
+4. **Prerequisite** — `lesson_chunks` must exist from a prior publish (Temporal `process_lessons_activity`). Without indexed content the stream returns a single message explaining that.
+5. **UI** — Course detail page shows **Instructor tools** (`GenerationPanel`) for course owners on published courses; streams tokens like the student assistant panel.
+
+Quiz markdown template (one block per question):
+
+```
+### Question N
+**Question:** ...
+- A) ...
+- B) ...
+- C) ...
+- D) ...
+**Correct answer:** A|B|C|D
+**Explanation:** ... (citing lesson title)
+```
+
+---
+
+## Session — 2026-06-08 (Tier 2 + dev admin)
+
+### Q: What are the SmartCourse dev admin login credentials?
+
+**A:** After `docker compose up` (migrate runs seed automatically):
+
+| Role | Email | Password |
+|---|---|---|
+| **Admin** | `admin@smartcourse.local` | `SmartCourseAdmin1!` |
+| **Instructor (demo)** | `instructor@smartcourse.local` | `SmartCourseInstruct1!` |
+
+Login: `POST /api/v1/auth/login` with `{ "username": "<email>", "password": "<password>" }` (OAuth2 form field names). Override via `.env`: `DEV_ADMIN_EMAIL`, `DEV_ADMIN_PASSWORD`, etc. Set `SEED_DEV_USERS=false` to skip.
+
+**Note:** Grafana is separate — default `admin` / `admin` at http://localhost:3000.
+
+### Q: What did Tier 2 add?
+
+**A:**
+
+1. **Mailhog + real welcome email** — `mailhog` service in compose; Celery `send_welcome_email` sends SMTP to Mailhog (UI http://localhost:8025).
+2. **Certificates** — Issued idempotently when enrollment auto-completes; `GET /api/v1/certificates/me` (student).
+3. **traceparent propagation** — Captured on outbox emit, forwarded in Kafka headers, restored in welcome-email consumer, events-archiver, and Celery tasks.
+4. **Re-index** — `POST /api/v1/courses/{id}/reindex` (202) enqueues Celery `tasks.reindex_course`; shared `content_indexing_service` with publish workflow.
+
+---
+
+## Session — 2026-06-09 (Deferred features: prerequisites, cache, recommendations, schema registry)
+
+### Q: Why do we need a Kafka Schema Registry?
+
+**A:** It's a versioned store of your event schemas (Avro / Protobuf / JSON Schema) sitting next to Kafka. The producer's serializer registers a schema and stamps every message with a schema-ID header; consumers read that ID and fetch the matching schema to decode. The point that matters is it **enforces a compatibility policy on every schema change**.
+
+**Problem it solves in SmartCourse:** our three events (`user.enrolled`, `lesson.completed`, `course.published`) are hand-rolled JSON dicts decoded by three independent consumers (welcome-email, events-archiver, analytics). That shape is an *implicit contract with zero enforcement* — rename `student_id → user_id` in the producer and consumers break at runtime, asynchronously, on a fraction of messages. Schema Registry makes the contract explicit and **rejects an incompatible change at the producer**, before a bad message reaches the topic. Secondary wins: smaller payloads (binary + schema ID) and a single source of truth for each event shape.
+
+**In Node terms:** like sharing a versioned protobuf / `@types` package between microservices, except the registry enforces compatibility at the wire boundary at runtime instead of trusting every service to rebuild — a CI gate that blocks a breaking change to a published OpenAPI/GraphQL schema, but for Kafka messages.
+
+**Honest take for this system:** lowest-ROI of the deferred features. One codebase, one team, we own every producer + consumer, three event types — the failure it prevents (independent teams evolving a shared topic out of sync) doesn't exist here yet. You'd get ~80% of the safety with a Pydantic model validating the envelope on the producer + a `schema_version` field. Worth doing because (1) it's in the prescribed stack and (2) it teaches the core lesson: **events are contracts; contracts need versioning + a compatibility policy.** Do it with `BACKWARD` compatibility and a test that proves a breaking change is rejected.
+
+### Q: How do you stop course prerequisites from forming a cycle?
+
+**A:** Prerequisites are a directed graph (edge "A requires B"). A cycle (A→B→A) makes every course in the loop permanently un-enrollable, so we reject it at *add* time. Before inserting "course requires prerequisite", walk the requirement graph starting from the prerequisite node with a **recursive CTE**; if it can already reach the course, adding the edge would close a loop → reject with `409`. A composite primary key blocks duplicate edges and a `CHECK (course_id <> prerequisite_id)` blocks the trivial self-loop, both at the DB level. Enrollment is then gated on *completion* of every prerequisite (not mere enrollment), checked inside the same `SELECT … FOR UPDATE` enrollment transaction — non-empty unmet set → `422`.
+
+### Q: Why cache the course catalog with a "generation" number instead of just deleting the keys?
+
+**A:** The catalog is paginated (`GET /courses?limit&offset`), so it's cached as many keys — `course:catalog:v{N}:{limit}:{offset}`. When a publish/update/archive changes which courses are published, *every* page is potentially stale. Deleting them would mean a `SCAN`+`DEL` over an unknown key set (slow, discouraged in prod). Instead we keep a generation counter `course:catalog:version` and a single `INCR` invalidates all pages at once — old keys become unreachable and expire by TTL. Course *detail* is simpler: one key per course (`course:detail:{id}`), deleted directly on change. Only **published** courses are cached — draft/archived visibility depends on the viewer, so caching them keyed by id alone would leak. The whole cache is best-effort: a short connect timeout + a cooldown circuit breaker mean a Redis outage degrades to Postgres reads, never an error.
+
+### Q: For recommendations, why count popularity in Postgres instead of the Mongo event log?
+
+**A:** Popularity must be an *exact* count, and Postgres `enrollments` is the source of truth. The Mongo `events` collection is a raw at-least-once interaction log — a redelivered `user.enrolled` appears twice, so counting there over-reports. Per our own tool-responsibility split (Postgres = consistency/truth, Mongo = analytics/behavioral log), the exact "most-enrolled" ranking is a Postgres `GROUP BY`. The Mongo log is the right source for *behavioral* signals instead — e.g. "students who took X also took Y" collaborative filtering — which is the natural next iteration. Recommendations also reuse the prerequisite graph: only courses whose prerequisites the student has completed are surfaced.
+
+### Q: Why an in-app schema gate instead of standing up the Confluent Schema Registry container?
+
+**A:** The value of a Schema Registry for this single-team system is the *contract discipline* — versioned event schemas + a compatibility rule enforced at the producer — not the Confluent infrastructure (which earns its keep when independent teams share topics). So we built that discipline in-process: `app/events/schema_registry.py` registers a schema per event, `validate()` rejects a malformed payload at emit time (mirroring SR rejecting an incompatible produce), and `is_backward_compatible()` encodes the BACKWARD rule (drop field / add optional = OK; add required / change type = rejected) with tests. Standing up Confluent SR + Avro is then a serialization swap at the relay, not a redesign — deliberately deferred as the lowest-ROI of the four features for a system where we own every producer and consumer.
+
+### Q: How were the deferred features verified, and why test that way?
+
+**A:** Each behavioural claim is encoded as a test (cycle → 409, unmet prereq → 422, stale cache busted on update, breaking schema change rejected). Two kinds:
+
+- **Integration tests** (real app + real Postgres + real Redis) for anything that depends on engine-specific behaviour — recursive CTEs, `SELECT … FOR UPDATE`, JSONB, generational cache keys. A SQLite stand-in would prove nothing because those features don't exist there.
+- **Pure unit tests** for the schema registry — validation and BACKWARD-compatibility are plain functions, no I/O needed.
+
+Two test-infra decisions worth noting: (1) a **Temporal-free direct-publish helper** creates a published course by flipping status in the DB, instead of running the real publish workflow — which would drag in the Week-4 embedding pipeline (torch). Prereq/cache/recommendation tests need a *published course to exist*, not the publish mechanism, so this is both faster and better isolation (the workflow has its own test). (2) The cache is **disabled by default under test** (a Redis instance outlives the per-test DB resets and would leak data across tests); one dedicated test re-enables it to prove caching + invalidation. The Alembic migration is verified separately (apply → check constraints → downgrade → re-apply) because the test schema is built with `create_all`, which never exercises the migration.
+
+### Q: How does a Kafka Schema Registry actually work (mechanics + compatibility modes)?
+
+**A:** It's a separate HTTP service beside Kafka (the broker itself only sees bytes — it knows nothing about schemas). The client-side serializers/deserializers talk to it.
+
+**Wire mechanics:** you register a schema (usually Avro) per topic "subject"; each version gets an integer **ID**. A produced message is `[magic byte][4-byte schema ID][binary payload]` — the schema is *not* in the message, only its ID. So messages are small (no repeated JSON keys) and self-identifying. Consumers read the ID, fetch that schema (cached), and decode; having both writer and reader schemas, Avro reconciles differences (defaults, skipped fields).
+
+**Compatibility modes** (checked when registering a new version; the mode reflects deployment order, since old+new run together during a rollout):
+
+| Mode | Guarantee | Upgrade first | May / may not |
+|---|---|---|---|
+| BACKWARD (default) | new reads old data | consumers | delete field, add optional ✅ / add required, change type ❌ |
+| FORWARD | old reads new data | producers | add field, delete optional ✅ |
+| FULL | both | either | optional add/delete only |
+| NONE | nothing | — | anything (risky) |
+
+A breaking change (e.g. rename `student_id`→`user_id` = drop a field + add a required one) is **rejected at registration** under BACKWARD, so the producer fails to deploy rather than breaking consumers silently in prod. The safe version is multi-step: add `user_id` optional → migrate consumers → backfill → remove `student_id`. See the earlier entry for why we deferred the Confluent service and mirror just the gate in-app.
+
+### Q: When do you actually need a Schema Registry vs. when is it overkill?
+
+**A:** The registry mainly defends against a schema change that *doesn't go through a single review*. So:
+
+**Need it when** — (1) **multiple teams/services share a topic** (no single PR fixes all consumers; the registry is the enforced contract + coordination point); (2) **polyglot consumers** (Java + Python + Go on one topic — no shared language type, so you need a language-neutral contract); (3) **long-lived events / event sourcing / long retention** (a consumer may replay an event written many versions ago → need compatibility across all history, via `*_TRANSITIVE`); (4) **formal governance/compliance** (auditable, versioned record of data contracts).
+
+**Overkill when (SmartCourse today)** — single codebase (a field rename is ONE PR touching producer + all consumers atomically — the "changed without telling the readers" failure can't happen); one team; you control + co-deploy every producer and consumer; only three event types. Pydantic/Zod validation at emit + a `schema_version` field is ~80% of the safety (catches malformed/typo'd payloads) for ~5% of the effort (no service, no Avro, no serialization rewrite). The missing 20% — automatic cross-version enforcement, cross-team/cross-language store, binary wire format, governance trail — doesn't pay off until a second team/non-Python consumer/long retention appears. Migration path then is a serialization swap at the relay, not a redesign.
+
+### Q: Explain each Schema Registry compatibility mode in detail (with deploy order).
+
+**A:** The mode encodes which direction must survive a rollout, which dictates deploy order (old + new always coexist mid-rollout). Running example `user.enrolled` v1 = `{enrollment_id, student_id, course_id, enrolled_at?}`.
+
+- **BACKWARD** (default): new schema reads old data → upgrade **consumers first**. Allowed: delete a field; add an *optional* field (needs a default). Rejected: add a *required* field; change a type. E.g. add `source` optional ✅, remove `enrolled_at` ✅, add required `tenant_id` ❌. Use it ~90% of the time: you grow the event with optional fields and drop fields freely.
+- **FORWARD**: old schema reads new data → upgrade **producers first**. Allowed: add a field (even required — old consumer ignores it); delete an *optional* field. Rejected: delete a *required* field; change a type. (Adding a required field being OK here but not under BACKWARD is the clearest proof that direction matters.)
+- **FULL**: both directions → any deploy order. Effectively only *optional add / optional delete* survive. Safest, strictest.
+- **NONE**: no checks — manage compatibility out-of-band; risky as a default.
+- **`_TRANSITIVE` variants**: check against *every* prior version, not just the latest. Needed when old data persists (long retention, replays, event sourcing) so a consumer might hit any historical version; non-transitive is fine when old messages age out before you evolve again.
+
+Caveat: changing a field type is unsafe in all modes except Avro's narrow promotions (`int→long`, `float→double`). A rename = delete-old + add-new (optionally with Avro `aliases`), which is why renames so often trip the compatibility check.
+
+### Q: What do p50 / p95 / p99 mean in the load baseline, and why record all three?
+
+**A:** Sort every request from fastest to slowest; a percentile is the time at the X% mark. **p50** (median) = the typical request (half faster, half slower). **p95** = only the slowest 5% were worse. **p99** = only the worst 1% were worse.
+
+Why not the average? The average *hides* the slow tail — 99 requests at 20 ms + 1 at 2000 ms averages to ~40 ms (looks fine) while one user waited 2 s; p99 catches it. The tail matters because at scale 1% is huge (1M req/day → 10k slow/day) and it compounds per user (a page firing 20 calls, each 1% slow, ≈ 18% chance of one slow call).
+
+Each answers a different question: p50 = "what's normal?", p95 = "the common bad case" (typical SLO target), p99 = "how bad is the tail?" (cold caches, lock waits, slow query plans). **The p50→p99 gap = consistency.** In our [LOAD_BASELINE.md](LOAD_BASELINE.md): `metrics/overview` 25→45 ms (tight, steady) vs `recommendations` 26→638 ms (24× gap → the uncached heavy query makes a minority of requests slow → the thing to watch).
+
+---
+
+## Session — 2026-06-11 (System-design deep-dive review)
+
+### Q: Difference between strong and eventual consistency — and where does SmartCourse use each?
+
+**A:** **Strong** = the instant a write is confirmed, every later read (anyone) sees it; there's one agreed "current value." **Eventual** = reads may be stale for a window, but converge once writes stop.
+
+**Why strong exists — the seat race:** course has 1 seat; A and B enrol simultaneously. Without coordination both read "1 left", both pass, both insert → oversold (corrupt state). With `SELECT … FOR UPDATE` the lock serialises them: A enrols (seats→0), B is blocked then reads 0 → rejected. "Guaranteed to see the latest" *is* strong consistency.
+
+**Why eventual is fine — the counter:** an enrolment's `user.enrolled` event updates the analytics total a few seconds later; an admin refreshing mid-window sees the old number, no one harmed, it converges.
+
+**The tradeoff:** strong needs coordination (a lock, a single source of truth, or consensus) → slower and unavailable during a partition (CAP). Eventual drops coordination → fast, available, scalable, correct-soon.
+
+**Decision rule:** "if a reader sees a stale value for a few seconds, is anyone harmed / does the system become incorrect?" Yes → strong (seats, balances, identity). No → eventual (counts, emails, caches).
+
+**In SmartCourse:** strong for enrolment+capacity (`FOR UPDATE`), `UNIQUE` dedupes, draft→published; eventual for analytics, welcome email, cached catalog/detail, recommendations, search index. The **outbox** bridges them — the enrolment row + the event commit in one transaction (strong, atomic), then the fact fans out eventually to Kafka consumers. The cache widened the eventual zone on reads (catalog stale up to its 30s TTL) — a conscious speed-for-freshness trade; caching a *seat count* would be a bug (making a strong fact eventual).
+
+**Caveat:** "consistency" here is the CAP/replication sense (do readers agree on the latest value?), *not* ACID's "C" (single-node constraint validity). `FOR UPDATE` happens to give both.
+
+### Q: Case 2 — Fault tolerance: the "exactly-once myth", DLQs, and what belongs in a critical path?
+
+**A:** Fault tolerance = recovering to a correct state without a human when (not if) something fails.
+
+**Exactly-once is a myth across systems.** You can't atomically commit Kafka offset + Postgres + RabbitMQ together, so you choose: at-most-once (ack then process → loss on crash) or at-least-once (process then ack → duplicate on crash). "Exactly-once" = at-least-once + an **idempotent consumer**. Our `welcome_email_consumer` does this deliberately: claim via `INSERT … ON CONFLICT DO NOTHING` on `(consumer, event_key)`, do work, COMMIT Postgres, *then* commit the Kafka offset. The dedupe row IS the idempotency key, and committing it before the offset makes every crash window safe (a 4→5 crash gives a duplicate task the idempotent task absorbs; a 5→6 crash gives exactly-once). It consciously prefers duplicate-over-lost. (Same pattern as deduping Stripe webhooks on event id.)
+
+**Missing DLQ = a liveness bug.** At-least-once + idempotency only handles *transient* faults. A *poison* message (corrupt bytes, always-throws) gets no offset commit → Kafka redelivers forever → because a partition is ordered, it **blocks everything behind it (head-of-line blocking)**. Fix: after N attempts route to a dead-letter topic/table, commit the offset, move on, alert. Tradeoff: give up one message to keep the pipeline flowing. Rule: *retry handles transient, DLQ handles permanent* — a retry loop with no DLQ/max-retries stalls the stream.
+
+**Durable ≠ belongs-in-the-critical-path.** The publish saga runs embedding (`process_lessons_activity`, torch) *inside* the compensated Temporal workflow, so an ML hiccup **reverts the publish to draft** — an optional feature breaking a core action (and it contradicts our own "content processing → async" rule). Temporal's durability tempted the critical path wider. Better: mark `published` immediately, index *after* as a separate async job (`indexed_at` when done) — a short "published, indexing…" window that harms no one. Rule: the critical path holds only what MUST be true for the op to be correct; for each step ask *"if this failed forever, should the whole operation fail?"* — if no, it's eventual async work outside the path. Ties to Case 1: indexing is eventual-consistency work wrongly placed inside a strong-consistency operation.
+
+### Q: In plain words — what's a DLQ? And in Design B, how does a user search a published-but-not-yet-embedded course?
+
+**A:** **DLQ (dead-letter queue)** = the "undeliverable mail bin." A permanently-broken message retried forever blocks every message ordered behind it on the partition (**head-of-line blocking** — a stalled car in a one-lane tunnel). After N tries you park it in a side topic/table, commit the offset, keep the pipeline flowing, and review it later.
+
+**Embedding-in-publish (plain):** publish runs a checklist and undoes everything if any step fails; the slow/fragile AI embedding step is in that checklist, so an AI hiccup cancels the whole publish — an optional "make it searchable" extra breaking the core action.
+
+**The Design B objection answered:** embedding takes the same time in *both* designs — the only difference is what the user can do during that unavoidable wait. Design A: course fully hidden (can't view/enroll/learn/search). Design B: course fully usable, only search briefly delayed. So Design B gives *more*, not less. Handle the gap with an "indexing…" state (`indexed_at = null` until done), like YouTube's "HD still processing" while the video already plays. Principle: **no free lunch — choose which downside you can live with**; a briefly-delayed *optional* feature beats a *failing core action*.
+
+### Q: What are the design patterns we're studying called?
+
+**A:** Consistency: **CAP theorem**, **strong vs eventual consistency**, **CQRS** (separate write model from read model). Fault tolerance: **transactional outbox**, **idempotent consumer**, **delivery semantics** (at-most/at-least/"exactly"-once = at-least-once + idempotency), **dead-letter queue**, **head-of-line blocking**, **Two Generals / distributed-commit problem**, **saga + compensating transactions**, **circuit breaker**.
+
+### Q: Case 3 — Scalability: where does SmartCourse hit a wall, and how do you scale around it?
+
+**A:** Scalability = still works at 10×/100×. Find the one thing every request must touch — that's the ceiling.
+
+**Scales easily:** the API is **stateless** (JWT carries identity) → add boxes behind a load balancer, any copy serves any request. **Kafka** is a shock absorber — a write spike commits to Postgres + outbox, and email/analytics consumers drain at their own pace.
+
+**Hits a wall — all at the single Postgres primary:**
+1. **Connection-pool cliff (an outage, not a slowdown):** `pool_size=10 + max_overflow=20` = 30/copy × 4 gunicorn workers = 120 > Postgres' default 100 → it *refuses* new connections. Fix: **PgBouncer** multiplexes hundreds of app connections onto ~20 real ones (tradeoff: transaction mode disallows some session features).
+2. **Hot-course lock serialization:** `FOR UPDATE` (the Case-1 correctness win) serializes every enrollment to one popular course through a single row lock. Fixes: optimistic concurrency (retry on conflict) or an atomic Redis seat counter (fast, but seats now live in two places → reconciliation, Redis becomes a correctness dependency). `FOR UPDATE` is the right default — only change if a measured spike hurts.
+3. **No read replica:** heavy analytics aggregations run on the same primary as live enrollments (OLTP vs OLAP contention). Fix: a read replica for analytics reads; tradeoff = replication lag (slightly stale dashboards, which is fine — eventual reads).
+4. **Recommendations tail** (measured p99 ~640ms): the one uncached heavy query; fix = short-TTL per-student cache.
+
+**Unifying insight:** one stateful chokepoint (the Postgres primary) — every scaling move routes load *around* it (PgBouncer, read replica, Redis counter, caching). **Ladder:** vertical (bigger box) → horizontal (more boxes; API yes, single primary no) → read replicas (scale reads) → sharding (split writes across primaries; last resort, big complexity). Patterns: connection pooling, OLTP vs OLAP, read replica, replication lag, vertical/horizontal scaling, sharding, optimistic vs pessimistic concurrency.
+
+### Q: How is "1k → 1M requests" handled, and what hardware does a million need?
+
+**A:** "1 million requests" is meaningless without a timeframe — the unit is **requests/sec (RPS)**: 1M/day ≈ 12/s (trivial), 1M/hour ≈ 280/s (one box), 1M/min ≈ 16,600/s (cluster), 1M/sec = Google-scale. Restaurant model: **API servers = waiters (easy to add); Postgres = the one kitchen (the bottleneck); Redis = a tray of ready dishes**. Ladder: ≤1k/s = one server + cache; 1k–10k/s = many stateless API boxes + load balancer + PgBouncer + cache + read replica; 10k–100k/s = autoscaled API + bigger/sharded DB; 1M/s = re-architect (fleet + sharded, multi-region). Measured: ~400 req/s per worker (DB endpoint, 0 errors), ~1k+/s per 4-worker box. Hardware for "a million": per *day* → tiny VM; per *hour* → one 4-CPU/8GB box + managed PG; per *minute* → ~10–20 API instances + PgBouncer + 8–16-CPU/32–64GB PG + replicas + Redis. **Which requests slow down:** the overflow that exceeds a resource queues, and the *tail* (p95/p99) degrades first (e.g. 120 requests vs 100 connections → ~20 wait).
+
+### Q: What is connection pooling (easy), and how much traffic can a normal DB handle?
+
+**A:** A **connection** is an expensive dedicated "phone line" to Postgres (handshake + auth + the DB spawns a process using a few MB). Opening one per request is wasteful. **Pooling** keeps a small set of warm lines and reuses them: borrow → query → return (don't hang up). Two wins: **speed** (skip setup) and **protection** (a hard cap on simultaneous connections; when the pool is full, extra requests *wait* — those are the slow ones). Our config: `pool_size=10` warm + `max_overflow=20` burst + `pool_pre_ping` (check the line is alive). Same as `pg.Pool`/Prisma/TypeORM `max`.
+
+**How much a normal DB handles** — key insight: requests/s ≠ queries/s ≠ connections. One connection = one checkout lane running *many* fast queries/sec, so you need a *handful* of fast lanes, not thousands. Ballparks on a standard 4–8-CPU SSD box (indexed + cached): simple reads ~10k–30k/s, simple writes ~2k–10k/s, complex joins/aggregations ~hundreds–low-thousands/s. Counterintuitive: **more connections past ~2–4× CPU cores makes it slower** (context-switch thrash) — that's why pooling caps it and PgBouncer funnels thousands of clients onto ~20–50 server connections. **Indexes + caching matter more than hardware** (a missing index = 100× slower). SmartCourse's ~400 req/s/worker already implies a real PG box serves tens of thousands of daily users — nowhere near the ceiling.

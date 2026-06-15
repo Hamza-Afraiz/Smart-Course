@@ -2,7 +2,20 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    Enum as SAEnum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Table,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -64,3 +77,28 @@ class Course(Base):
     certificates: Mapped[list["Certificate"]] = relationship(
         "Certificate", back_populates="course"
     )
+
+
+# Self-referential M2M: a course requires N other courses to be completed first.
+# Composite PK forbids duplicate edges; the CHECK forbids a self-loop at the DB
+# level (the service also rejects it, but defense in depth). No ORM relationship
+# is declared on Course — reads go through explicit repo queries so we never
+# trip an async lazy-load and can express the recursive cycle check in SQL.
+course_prerequisites = Table(
+    "course_prerequisites",
+    Base.metadata,
+    Column(
+        "course_id",
+        UUID(as_uuid=True),
+        ForeignKey("courses.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "prerequisite_id",
+        UUID(as_uuid=True),
+        ForeignKey("courses.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    CheckConstraint("course_id <> prerequisite_id", name="ck_course_prereq_no_self"),
+    Index("idx_course_prereq_prerequisite", "prerequisite_id"),
+)

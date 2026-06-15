@@ -13,8 +13,11 @@ import uuid
 from sqlalchemy import Numeric, case, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from datetime import datetime, timezone
+
 from app.models.course import Course, CourseStatus
 from app.models.enrollment import Enrollment, EnrollmentStatus
+from app.models.outbox import OutboxEvent
 from app.models.user import User, UserRole
 
 
@@ -102,3 +105,38 @@ async def list_popular_courses(
         .limit(limit)
     )
     return [(cid, title, int(n)) for cid, title, n in result.all()]
+
+
+async def outbox_health_stats(db: AsyncSession) -> dict[str, int | float | None | dict[str, int]]:
+    """Unsent outbox rows — the primary 'failed / stuck pipeline' signal for admins."""
+    pending_result = await db.execute(
+        select(func.count())
+        .select_from(OutboxEvent)
+        .where(OutboxEvent.sent_at.is_(None))
+    )
+    pending_count = int(pending_result.scalar_one())
+
+    oldest_pending_seconds: float | None = None
+    pending_by_type: dict[str, int] = {}
+    if pending_count:
+        oldest_result = await db.execute(
+            select(func.min(OutboxEvent.created_at)).where(OutboxEvent.sent_at.is_(None))
+        )
+        oldest_dt = oldest_result.scalar_one()
+        if oldest_dt is not None:
+            oldest_pending_seconds = (
+                datetime.now(timezone.utc) - oldest_dt
+            ).total_seconds()
+
+        type_result = await db.execute(
+            select(OutboxEvent.event_type, func.count())
+            .where(OutboxEvent.sent_at.is_(None))
+            .group_by(OutboxEvent.event_type)
+        )
+        pending_by_type = {event_type: int(n) for event_type, n in type_result.all()}
+
+    return {
+        "pending_count": pending_count,
+        "oldest_pending_seconds": oldest_pending_seconds,
+        "pending_by_type": pending_by_type,
+    }

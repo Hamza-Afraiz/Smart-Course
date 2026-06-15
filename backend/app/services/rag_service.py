@@ -23,6 +23,7 @@ from opentelemetry import trace
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.user import User
 from app.repositories import search_repo
 from app.services import embedding_service, llm_service
 
@@ -123,5 +124,144 @@ async def answer_stream(
 
     async for token in llm_service.stream_chat(
         system=_SYSTEM_PROMPT, user=user_prompt
+    ):
+        yield token
+
+
+# ── Instructor content generation (Week 5 extension) ─────────────────────────
+# Same RAG pipeline as Q&A — different system prompts for summary vs quiz.
+
+_SUMMARY_SYSTEM = (
+    "You are SmartCourse's instructor assistant. Summarize lesson or course "
+    "content clearly for instructors preparing materials. Use ONLY the context "
+    "below — do not invent facts. Prefer concise bullet points. Mention lesson "
+    "titles when useful."
+)
+
+_QUIZ_SYSTEM = (
+    "You are SmartCourse's instructor assistant. Create multiple-choice quiz "
+    "questions ONLY from the provided context. Never invent facts or add "
+    "preamble, closing remarks, or sections outside the required format."
+)
+
+_QUIZ_QUESTION_BLOCK = """\
+### Question {n}
+**Question:** <question text>
+- A) <option>
+- B) <option>
+- C) <option>
+- D) <option>
+**Correct answer:** <A|B|C|D>
+**Explanation:** <one line citing the lesson title>"""
+
+
+def build_generation_prompts(
+    *,
+    kind: str,
+    scope: str,
+    context: str,
+) -> tuple[str, str, float]:
+    """Return (system_prompt, user_prompt, temperature) for instructor generation."""
+    if kind == "summary":
+        return (
+            _SUMMARY_SYSTEM,
+            (
+                f"Context from {scope}:\n\n{context}\n\n"
+                "Write a clear summary of the key points an instructor should "
+                "emphasize. Use only the context above."
+            ),
+            0.2,
+        )
+
+    format_example = _QUIZ_QUESTION_BLOCK.format(n=1)
+    return (
+        _QUIZ_SYSTEM,
+        (
+            f"Context from {scope}:\n\n{context}\n\n"
+            "Create up to 5 multiple-choice quiz questions for students using "
+            "ONLY the context above.\n\n"
+            "Use exactly this markdown structure for each question (number 1 through 5). "
+            "Do not add any text before the first question or after the last explanation.\n\n"
+            f"{format_example}"
+        ),
+        0.1,
+    )
+
+_COURSE_SUMMARY_QUERY = (
+    "Main topics, concepts, and learning objectives covered in this course"
+)
+
+
+async def _hits_for_generation(
+    db: AsyncSession,
+    *,
+    course_id: uuid.UUID,
+    lesson_id: uuid.UUID | None,
+) -> list[dict]:
+    """Context for instructor generation — all chunks for one lesson, or top-K for course."""
+    if lesson_id is not None:
+        rows = await search_repo.list_chunks_for_lesson(
+            db, lesson_id=lesson_id, course_id=course_id
+        )
+        return [
+            {
+                "lesson_id": row["lesson_id"],
+                "lesson_title": row["lesson_title"],
+                "text": row["text"],
+                "similarity": 1.0,
+            }
+            for row in rows
+        ]
+    return await retrieve(
+        db,
+        question=_COURSE_SUMMARY_QUERY,
+        course_id=course_id,
+        top_k=settings.rag_top_k,
+    )
+
+
+async def generate_stream(
+    db: AsyncSession,
+    *,
+    course_id: uuid.UUID,
+    lesson_id: uuid.UUID | None,
+    kind: str,
+    actor: User,
+) -> AsyncIterator[str]:
+    """Stream a lesson/course summary or quiz for the course owner (instructor/admin).
+
+    Caller must verify ownership before streaming (router does this so 403/404
+    are normal HTTP errors, not SSE payloads).
+    """
+    _ = actor  # reserved for future audit logging
+
+    with _tracer.start_as_current_span("rag.generate") as span:
+        span.set_attribute("rag.course_id", str(course_id))
+        span.set_attribute("rag.generation_kind", kind)
+        if lesson_id:
+            span.set_attribute("rag.lesson_id", str(lesson_id))
+
+        hits = await _hits_for_generation(db, course_id=course_id, lesson_id=lesson_id)
+        span.set_attribute("rag.hits_used", len(hits))
+
+    if not hits:
+        yield (
+            "No indexed lesson content found. Publish the course first so the "
+            "publishing workflow can extract, chunk, and embed the material."
+        )
+        return
+
+    with _tracer.start_as_current_span("rag.build_prompt") as span:
+        context, trimmed_count = _build_context(hits)
+        scope = hits[0]["lesson_title"] if lesson_id else "this course"
+        system, user_prompt, temperature = build_generation_prompts(
+            kind=kind, scope=scope, context=context
+        )
+        span.set_attribute("rag.context_chars", len(context))
+        span.set_attribute("rag.prompt_chars", len(user_prompt) + len(system))
+        span.set_attribute("rag.chunks_trimmed", trimmed_count)
+
+    async for token in llm_service.stream_chat(
+        system=system, user=user_prompt, temperature=temperature
     ):
         yield token

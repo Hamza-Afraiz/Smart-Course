@@ -68,3 +68,22 @@ class RecentActivityItem(BaseModel):
 
 class RecentActivity(BaseModel):
     items: list[RecentActivityItem]
+
+
+class OutboxHealth(BaseModel):
+    pending_count: int
+    oldest_pending_seconds: float | None
+    pending_by_type: dict[str, int]
+
+
+class PipelineHealth(BaseModel):
+    """PRD §5 — Failed Events / Workflow Issues (operator view).
+
+    `status` is derived from outbox backlog — the durable signal that events
+    are stuck before Kafka when relay or broker is unhealthy.
+    """
+
+    status: str  # healthy | degraded | critical
+    outbox: OutboxHealth
+    consumer_errors_total: int
+    hints: list[str]

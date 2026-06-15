@@ -5,6 +5,7 @@ import type {
   CompletionMetrics,
   EnrollmentsTimeSeries,
   OverviewMetrics,
+  PipelineHealth,
   PopularCourses,
   RecentActivity,
 } from "../api/types";
@@ -16,6 +17,7 @@ interface Bundle {
   popular: PopularCourses;
   series: EnrollmentsTimeSeries;
   activity: RecentActivity;
+  pipeline: PipelineHealth;
 }
 
 function fmtPercent(p: number): string {
@@ -52,15 +54,17 @@ export default function AdminMetricsPage() {
     let cancelled = false;
     async function load() {
       try {
-        const [overview, completion, popular, series, activity] = await Promise.all([
+        const [overview, completion, popular, series, activity, pipeline] =
+          await Promise.all([
           metricsApi.getOverview(),
           metricsApi.getCompletion(),
           metricsApi.getPopularCourses(10),
           metricsApi.getEnrollmentsOverTime(30),
           metricsApi.getRecentActivity(15),
+          metricsApi.getPipelineHealth(),
         ]);
         if (cancelled) return;
-        setData({ overview, completion, popular, series, activity });
+        setData({ overview, completion, popular, series, activity, pipeline });
       } catch (err) {
         if (!cancelled) setError(errorMessage(err, "Failed to load metrics"));
       } finally {
@@ -120,6 +124,43 @@ export default function AdminMetricsPage() {
           value={fmtDuration(data.completion.avg_completion_seconds)}
           sub="enrolled → all lessons done"
         />
+      </section>
+
+      {/* ── Event pipeline health (PRD §5 failed-events signal) ─────── */}
+      <section className="panel pipeline-health-panel">
+        <h2 className="panel-title">Event pipeline health</h2>
+        <div className="pipeline-health-row">
+          <span className={`pipeline-badge pipeline-${data.pipeline.status}`}>
+            {data.pipeline.status}
+          </span>
+          <span className="muted">
+            Outbox pending: <strong>{data.pipeline.outbox.pending_count}</strong>
+            {data.pipeline.outbox.oldest_pending_seconds != null && (
+              <>
+                {" "}
+                · oldest{" "}
+                <strong>{Math.round(data.pipeline.outbox.oldest_pending_seconds)}s</strong>
+              </>
+            )}
+            {" · "}
+            consumer errors: <strong>{data.pipeline.consumer_errors_total}</strong>
+          </span>
+        </div>
+        {data.pipeline.hints.length > 0 && (
+          <ul className="pipeline-hints muted small">
+            {data.pipeline.hints.map((h) => (
+              <li key={h}>{h}</li>
+            ))}
+          </ul>
+        )}
+        {Object.keys(data.pipeline.outbox.pending_by_type).length > 0 && (
+          <p className="muted small">
+            Pending by type:{" "}
+            {Object.entries(data.pipeline.outbox.pending_by_type)
+              .map(([t, n]) => `${t} (${n})`)
+              .join(", ")}
+          </p>
+        )}
       </section>
 
       {/* ── Popular courses + Recent activity side by side ─────────── */}

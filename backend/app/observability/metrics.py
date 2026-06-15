@@ -11,7 +11,7 @@ Naming follows Prometheus conventions:
   - label names lowercase, no high-cardinality values
 """
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 # ── Business counters ────────────────────────────────────────────────────────
 
@@ -37,6 +37,11 @@ outbox_published_total = Counter(
     "smartcourse_outbox_published_total",
     "Outbox rows successfully published to Kafka by the relay",
     ["event_type"],
+)
+
+outbox_pending = Gauge(
+    "smartcourse_outbox_pending",
+    "Outbox rows waiting for the relay (sent_at IS NULL) — backlog / failure signal",
 )
 
 

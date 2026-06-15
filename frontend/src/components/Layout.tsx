@@ -21,7 +21,10 @@ export default function Layout() {
           <nav className="nav-links">
             <NavLink to="/courses">Catalog</NavLink>
             {user?.role === "student" && (
-              <NavLink to="/my-enrollments">My Learning</NavLink>
+              <>
+                <NavLink to="/my-enrollments">My Learning</NavLink>
+                <NavLink to="/my-certificates">Certificates</NavLink>
+              </>
             )}
             {(user?.role === "instructor" || user?.role === "admin") && (
               <NavLink to="/my-courses">My Courses</NavLink>

@@ -44,9 +44,12 @@ SmartCourse must provide:
 | UC-09 | Student | Enroll in a published course | Published course; under capacity; not already enrolled | Enrollment created; duplicate/capacity/draft cases rejected |
 | UC-10 | Student | List own enrollments with progress summary | Has enrollments | Returns course title and completion stats |
 | UC-11 | Student | Mark lessons complete and finish a course | Enrolled; lesson belongs to course | Progress recorded; idempotent; enrollment completes when all lessons done |
-| UC-12 | Instructor | Publish course via durable multi-step workflow (planned) | Draft with content | Temporal workflow; partial failure compensated (Week 2 Chunk B) |
-| UC-13 | System | Emit and process lifecycle events (planned) | Enrollment / publish / completion | Kafka + consumers; no double-processing (Week 3) |
-| UC-14 | Operator | Observe health, metrics, and traces (planned) | Stack running | Prometheus, Grafana, Jaeger, OTel (Week 3) |
+| UC-12 | Instructor | Publish course via durable multi-step workflow | Draft with content | Temporal workflow; partial failure compensated |
+| UC-13 | System | Emit and process lifecycle events | Enrollment / publish / completion | Kafka + consumers; idempotent dedupe |
+| UC-14 | Operator | Observe health, metrics, and traces | Stack running | Prometheus, Grafana, Jaeger, OTel |
+| UC-15 | Student / Instructor | Semantic search over course content | Course published + indexed | `POST /search/semantic` or `/search/my` |
+| UC-16 | Student | Ask questions grounded in course material | Enrolled or course published | RAG Q&A via `POST /assistant/ask` (SSE) |
+| UC-17 | Instructor | Generate lesson/course summary or quiz | Owns course; content indexed | `POST /assistant/generate` (SSE) |
 
 ---
 
@@ -69,15 +72,15 @@ SmartCourse must provide:
 | NFR-C02 | Duplicate enrollments | DB `UNIQUE(student_id, course_id)`; surfaced as 409 | Implemented |
 | NFR-C03 | Enrollment capacity under concurrency | No over-enrollment when `max_students` set; `SELECT … FOR UPDATE` on course row | Implemented |
 | NFR-C04 | Lesson completion idempotency | `UNIQUE(enrollment_id, lesson_id)`; safe retries | Implemented |
-| NFR-C05 | Cross-component consistency (enrollment vs analytics) | Enrollment commits independently; analytics eventual (outbox + idempotent consumers) | Planned Week 3 |
+| NFR-C05 | Cross-component consistency (enrollment vs analytics) | Enrollment commits independently; analytics eventual (outbox + idempotent consumers) | Implemented |
 
 ### Reliability & operability
 
 | ID | Requirement | Target / rule | Status |
 |----|-------------|---------------|--------|
-| NFR-R01 | Publishing partial failure | Saga / compensations; course not left corrupted | Planned Week 2 Chunk B (Temporal) |
-| NFR-R02 | Background task retry | Celery retries; Kafka consumer idempotency | Planned Week 3 |
-| NFR-R03 | Failure diagnosis | Structured logs; metrics; distributed traces | Partial (logging); metrics/traces Week 3 |
+| NFR-R01 | Publishing partial failure | Saga / compensations; course not left corrupted | Implemented (Temporal) |
+| NFR-R02 | Background task retry | Celery retries; Kafka consumer idempotency | Implemented |
+| NFR-R03 | Failure diagnosis | Structured logs; metrics; distributed traces | Implemented (partial cross-service trace stitching — see QA.md) |
 
 ### Performance & scalability (Part A trajectory)
 
@@ -85,7 +88,7 @@ SmartCourse must provide:
 |----|-------------|---------------|--------|
 | NFR-P01 | API concurrency model | Async FastAPI + async SQLAlchemy; no blocking I/O in request path | Implemented |
 | NFR-P02 | DB connection discipline | Pooled connections; engine dispose on shutdown | Implemented |
-| NFR-P03 | Load & latency SLOs | Define p95/p99 per endpoint under load test harness | To be baselined in Week 3 with metrics |
+| NFR-P03 | Load & latency SLOs | Define p95/p99 per endpoint under load test harness | Implemented — p50/p95/p99 + throughput recorded per endpoint in [LOAD_BASELINE.md](LOAD_BASELINE.md) via `scripts/load_baseline.py` |
 | NFR-P04 | Horizontal API scaling | Stateless API instances; shared Postgres/Redis | Architecture supports; not load-tested yet |
 
 ### Maintainability
@@ -139,7 +142,7 @@ SmartCourse must provide:
 - Average Time to Complete a Course
 - Most Popular Courses
 - Average Courses per Student
-- Failed Events / Workflow Issues
+- Failed Events / Workflow Issues — **implemented:** `GET /admin/metrics/pipeline-health` + Grafana outbox backlog panel
 
 ### 6. System Observability & Reliability
 - Clear separation of responsibilities between components
@@ -155,7 +158,9 @@ SmartCourse must provide:
 |-----------|---------|----------|----------------|
 | M1 — Foundation | Week 1 | Users, courses, modules, lessons; JWT; Docker; Alembic | [WEEK1_PLAN.md](WEEK1_PLAN.md), [PROGRESS.md](PROGRESS.md) |
 | M2 — Enrollment + publish orchestration | Week 2 | Reliable enrollment + Temporal publishing | [PROGRESS.md](PROGRESS.md), [CLAUDE.md](../CLAUDE.md) (Saga / Temporal) |
-| M3 — Events + observability | Week 3 | Kafka, Celery, analytics pipeline, metrics/traces | [EXECUTION_GUIDELINES.md](EXECUTION_GUIDELINES.md) |
+| M3 — Events + observability | Week 3 | Kafka, Celery, analytics pipeline, metrics/traces | [EXECUTION_GUIDELINES.md](EXECUTION_GUIDELINES.md), [PROGRESS.md](PROGRESS.md) |
+| M4 — Retrieval layer | Week 4 | Chunking, embeddings, pgvector, semantic search | [PROGRESS.md](PROGRESS.md) |
+| M5 — AI assistant | Week 5 | RAG Q&A, instructor content generation, LLM observability | [PROGRESS.md](PROGRESS.md) |
 
 Formal PRD submission expectations (from Part A brief):
 
@@ -180,11 +185,19 @@ Requirements map to **implementation** (primary module or path) and **verificati
 | FR-1.6 | Student enrollment + capacity + idempotency | `app/services/enrollment_service.py`, `app/repositories/enrollment_repo.py` | `tests/test_enrollments.py` (`test_student_can_enroll_*`, `test_duplicate_*`, `test_capacity_*`, `test_concurrent_*`) |
 | FR-1.7 | List enrollments + progress summary | `app/routers/enrollments.py`, `enrollment_service.compute_progress_summary` | `test_list_my_enrollments_*`, `test_instructor_cannot_list_*` |
 | FR-1.8 | Lesson completion + auto-complete course | `enrollment_service.complete_lesson`, `progress_repo` | `test_mark_lesson_*`, `test_enrollment_auto_completes_*` |
-| FR-2.1 | Publishing workflow (Temporal, compensations) | Planned: `app/workers/` + workflow module | Planned Week 2 Chunk B |
-| FR-3.1 | Kafka events + consumers | Planned Week 3 | — |
-| FR-3.2 | Celery tasks (notifications, analytics) | Planned Week 3 | — |
-| FR-4.1 | Analytics metrics endpoints / aggregates | Planned Week 3 | — |
-| FR-5.1 | Prometheus / OTel / Jaeger | Planned Week 3 | — |
+| FR-2.1 | Publishing workflow (Temporal, compensations) | `app/temporal/workflows/course_publishing.py`, `app/temporal/activities/course_publish.py` | `tests/test_temporal_publish.py` |
+| FR-3.1 | Kafka events + consumers | `app/workers/outbox_relay.py`, `welcome_email_consumer.py`, `events_archiver.py` | `tests/test_week3_5_smoke.py` |
+| FR-3.2 | Celery tasks (notifications, analytics) | `app/workers/celery_app.py` | Manual smoke |
+| FR-4.1 | Analytics metrics endpoints / aggregates | `app/routers/metrics.py`, `app/services/metrics_service.py` | smoke + manual |
+| FR-4.2 | Semantic search | `app/routers/search.py`, `app/services/search_service.py` | `tests/test_week3_5_smoke.py` |
+| FR-4.3 | Pipeline / failed-events health | `GET /admin/metrics/pipeline-health`, `smartcourse_outbox_pending` | `tests/test_week3_5_smoke.py` |
+| FR-5.1 | Prometheus / OTel / Jaeger | `app/observability/`, `backend/observability/` | Grafana dashboards |
+| FR-5.2 | RAG Q&A assistant | `app/routers/assistant.py`, `app/services/rag_service.py` | `tests/test_week3_5_smoke.py` |
+| FR-5.3 | Instructor content generation (summary / quiz) | `app/routers/assistant.py` (`/generate`), `rag_service.generate_stream` | `tests/test_assistant_generate.py` |
+| FR-6.1 | Course prerequisites (graph + cycle detection + completion-gated enrolment) | `app/services/prerequisite_service.py`, `app/repositories/prerequisite_repo.py`, migration `9c5d7e8f2a31` | `tests/test_prerequisites.py` (12) |
+| FR-6.2 | Recommendations (prereq-eligible, popularity-ranked) | `app/services/recommendation_service.py`, `app/repositories/recommendation_repo.py` | `tests/test_recommendations.py` (6) |
+| FR-6.3 | Redis hot-path cache (cache-aside + generational invalidation + circuit breaker) | `app/cache.py`, `app/services/course_service.py` | `tests/test_cache.py` (3) |
+| FR-6.4 | Event schema registry (contract validation + BACKWARD gate) | `app/events/schema_registry.py`, wired into `event_service.emit` | `tests/test_schema_registry.py` (11) |
 | NFR-S01–S04 | Security & authz | `app/config.py`, `dependencies.py`, services | Implicit via role/404 tests in `test_courses.py`, `test_enrollments.py` |
 | NFR-C01–C04 | DB consistency & enrollment races | `database.py`, `enrollment_repo.lock_course_for_enrollment` | `test_concurrent_enrollment_respects_capacity`, UNIQUE tests |
 | NFR-M01–M03 | Layering, migrations, tests | Repo layout, `alembic/`, `tests/` | Full `pytest` suite |

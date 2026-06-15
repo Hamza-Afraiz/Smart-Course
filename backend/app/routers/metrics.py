@@ -5,6 +5,7 @@ from app.schemas.metrics import (
     CompletionMetrics,
     EnrollmentsTimeSeries,
     OverviewMetrics,
+    PipelineHealth,
     PopularCourses,
     RecentActivity,
 )
@@ -51,3 +52,9 @@ async def get_recent_activity(
 ) -> RecentActivity:
     """Latest events of any type, from the Mongo event log."""
     return await metrics_service.recent_activity(limit=limit)
+
+
+@router.get("/pipeline-health", response_model=PipelineHealth)
+async def get_pipeline_health(_admin: AdminUser, db: DBSession) -> PipelineHealth:
+    """Event pipeline health — outbox backlog + consumer error counter (PRD §5)."""
+    return await metrics_service.pipeline_health(db)

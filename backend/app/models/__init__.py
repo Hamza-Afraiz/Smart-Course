@@ -1,6 +1,6 @@
 from app.models.base import Base
 from app.models.certificate import Certificate
-from app.models.course import Course, CourseStatus
+from app.models.course import Course, CourseStatus, course_prerequisites
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.lesson import ContentType, Lesson
 from app.models.lesson_chunk import LessonChunk
@@ -16,6 +16,7 @@ __all__ = [
     "UserRole",
     "Course",
     "CourseStatus",
+    "course_prerequisites",
     "Module",
     "Lesson",
     "ContentType",

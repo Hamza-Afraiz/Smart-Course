@@ -64,33 +64,42 @@ def _event_key_from(headers: list[tuple[str, bytes]] | None) -> str | None:
     return None
 
 
+def _header(headers: list[tuple[str, bytes]] | None, name: str) -> str | None:
+    for k, v in headers or []:
+        if k == name:
+            return v.decode()
+    return None
+
+
 async def _handle(msg) -> str:
     """Process one Kafka message. Returns a short status for the log line."""
     event_key = _event_key_from(msg.headers)
     if not event_key:
         return "missing-key"
 
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            claimed = await processed_events_repo.claim(
-                session, consumer=CONSUMER_NAME, event_key=event_key
-            )
-            if not claimed:
-                return f"duplicate {event_key}"
+    traceparent = _header(msg.headers, "traceparent")
 
-            payload: dict[str, Any] = json.loads(msg.value)
-            enrollment_id = payload.get("enrollment_id")
-            if not enrollment_id:
-                # Don't enqueue garbage; still commit the dedupe row so we
-                # don't keep retrying a malformed message forever.
-                logger.warning("welcome-email: payload missing enrollment_id: %s", payload)
-                return f"bad-payload {event_key}"
+    from app.observability.propagation import use_traceparent
 
-            # Enqueue inside the TX. If COMMIT fails after this, the task is
-            # already on RabbitMQ; redelivery from Kafka would enqueue again.
-            # That's the documented duplicate-task tradeoff.
-            send_welcome_email.delay(enrollment_id)
-            return f"enqueued {event_key} → enrollment={enrollment_id}"
+    async with use_traceparent(traceparent):
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                claimed = await processed_events_repo.claim(
+                    session, consumer=CONSUMER_NAME, event_key=event_key
+                )
+                if not claimed:
+                    return f"duplicate {event_key}"
+
+                payload: dict[str, Any] = json.loads(msg.value)
+                enrollment_id = payload.get("enrollment_id")
+                if not enrollment_id:
+                    logger.warning(
+                        "welcome-email: payload missing enrollment_id: %s", payload
+                    )
+                    return f"bad-payload {event_key}"
+
+                send_welcome_email.delay(enrollment_id, traceparent)
+                return f"enqueued {event_key} → enrollment={enrollment_id}"
 
 
 async def _run() -> None:

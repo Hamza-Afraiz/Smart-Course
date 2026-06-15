@@ -57,6 +57,13 @@ def _topic_for(event_type: str) -> str:
 
 async def _publish_one(producer: AIOKafkaProducer, row) -> None:
     """Send one outbox row to Kafka, waiting for the ack."""
+    headers: list[tuple[str, bytes]] = [
+        ("idempotency_key", row.event_key.encode()),
+        ("event_type", row.event_type.encode()),
+        ("outbox_id", str(row.id).encode()),
+    ]
+    if row.traceparent:
+        headers.append(("traceparent", row.traceparent.encode()))
     await producer.send_and_wait(
         topic=_topic_for(row.event_type),
         # Key drives Kafka partitioning — same business event always lands on
@@ -64,12 +71,17 @@ async def _publish_one(producer: AIOKafkaProducer, row) -> None:
         # the consumer-side idempotency key.
         key=row.event_key.encode(),
         value=json.dumps(row.payload).encode(),
-        headers=[
-            ("idempotency_key", row.event_key.encode()),
-            ("event_type", row.event_type.encode()),
-            ("outbox_id", str(row.id).encode()),
-        ],
+        headers=headers,
     )
+
+
+async def _refresh_outbox_pending_gauge() -> None:
+    from app.observability import metrics
+    from app.repositories import metrics_repo
+
+    async with AsyncSessionLocal() as session:
+        stats = await metrics_repo.outbox_health_stats(session)
+        metrics.outbox_pending.set(int(stats["pending_count"]))
 
 
 async def _run_one_tick(producer: AIOKafkaProducer) -> int:
@@ -125,6 +137,7 @@ async def _run() -> None:
     try:
         while not stop_event.is_set():
             try:
+                await _refresh_outbox_pending_gauge()
                 n = await _run_one_tick(producer)
                 if n > 0:
                     logger.info("outbox-relay: published %d events", n)

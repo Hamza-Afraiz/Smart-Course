@@ -9,9 +9,12 @@ from app.exceptions import (
     CourseNotFoundError,
     CourseNotPublishedError,
     ForbiddenError,
+    InvalidPrerequisiteError,
     InvalidStatusTransitionError,
     ModuleNotFoundError,
     OrderIndexConflictError,
+    PrerequisiteCycleError,
+    PrerequisitesNotMetError,
     PublishWorkflowInProgressError,
     TemporalUnavailableError,
     WorkflowNotFoundError,
@@ -20,13 +23,18 @@ from app.schemas.course import CourseCreate, CourseResponse, CourseUpdate
 from app.schemas.enrollment import EnrollmentResponse
 from app.schemas.lesson import LessonCreate, LessonResponse
 from app.schemas.module import ModuleCreate, ModuleResponse
+from app.schemas.prerequisite import PrerequisiteAdd, PrerequisiteCourse
 from app.schemas.publish import PublishAcceptedResponse, PublishStatusResponse
+from app.schemas.recommendation import CourseRecommendation
+from app.schemas.reindex import ReindexAcceptedResponse
 from app.services import (
     course_service,
     enrollment_service,
     lesson_service,
     module_service,
+    prerequisite_service,
     publish_service,
+    recommendation_service,
 )
 
 router = APIRouter(tags=["Courses"])
@@ -56,7 +64,7 @@ async def list_courses(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ) -> list[CourseResponse]:
-    return await course_service.list_published(db, limit=limit, offset=offset)
+    return await course_service.list_catalog(db, limit=limit, offset=offset)
 
 
 # declared before /{course_id} so "mine" is not parsed as a UUID path param
@@ -72,10 +80,19 @@ async def list_my_courses(
     )
 
 
+@router.get("/recommendations", response_model=list[CourseRecommendation])
+async def recommend_courses(
+    student: StudentUser,
+    db: DBSession,
+    limit: int = Query(10, ge=1, le=50),
+) -> list[CourseRecommendation]:
+    return await recommendation_service.recommend(db, student=student, limit=limit)
+
+
 @router.get("/{course_id}", response_model=CourseResponse)
 async def get_course(course_id: uuid.UUID, current_user: CurrentUser, db: DBSession) -> CourseResponse:
     try:
-        return await course_service.get_for_view(db, course_id, current_user)
+        return await course_service.get_course_detail(db, course_id, current_user)
     except CourseNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
 
@@ -175,6 +192,96 @@ async def publish_course_status(
         )
 
 
+@router.post(
+    "/{course_id}/reindex",
+    response_model=ReindexAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reindex_course(
+    course_id: uuid.UUID,
+    instructor: InstructorUser,
+    db: DBSession,
+) -> ReindexAcceptedResponse:
+    try:
+        await course_service.trigger_reindex(db, course_id=course_id, actor=instructor)
+        return ReindexAcceptedResponse(course_id=str(course_id))
+    except CourseNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    except ForbiddenError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except CourseNotPublishedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+# ── Prerequisites ─────────────────────────────────────────────────────────────
+
+@router.get(
+    "/{course_id}/prerequisites", response_model=list[PrerequisiteCourse]
+)
+async def list_prerequisites(
+    course_id: uuid.UUID, current_user: CurrentUser, db: DBSession
+) -> list[PrerequisiteCourse]:
+    try:
+        return await prerequisite_service.list_prerequisites(
+            db, course_id=course_id, viewer=current_user
+        )
+    except CourseNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+
+
+@router.post(
+    "/{course_id}/prerequisites",
+    response_model=list[PrerequisiteCourse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_prerequisite(
+    course_id: uuid.UUID,
+    payload: PrerequisiteAdd,
+    instructor: InstructorUser,
+    db: DBSession,
+) -> list[PrerequisiteCourse]:
+    try:
+        return await prerequisite_service.add_prerequisite(
+            db,
+            course_id=course_id,
+            prerequisite_id=payload.prerequisite_id,
+            actor=instructor,
+        )
+    except CourseNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    except ForbiddenError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except InvalidPrerequisiteError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+        )
+    except PrerequisiteCycleError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+@router.delete(
+    "/{course_id}/prerequisites/{prerequisite_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def remove_prerequisite(
+    course_id: uuid.UUID,
+    prerequisite_id: uuid.UUID,
+    instructor: InstructorUser,
+    db: DBSession,
+) -> None:
+    try:
+        await prerequisite_service.remove_prerequisite(
+            db,
+            course_id=course_id,
+            prerequisite_id=prerequisite_id,
+            actor=instructor,
+        )
+    except CourseNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    except ForbiddenError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
 # ── Modules ───────────────────────────────────────────────────────────────────
 
 @router.post(
@@ -236,6 +343,10 @@ async def enroll_in_course(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except CourseFullError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except PrerequisitesNotMetError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+        )
     except AlreadyEnrolledError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 

@@ -58,53 +58,55 @@ def _header(headers, name: str) -> str | None:
 
 async def _archive(msg) -> str:
     """Process one Kafka message. Returns a short status for logging."""
+    from app.observability.propagation import use_traceparent
+
     event_key = _header(msg.headers, "idempotency_key")
     event_type = _header(msg.headers, "event_type")
+    traceparent = _header(msg.headers, "traceparent")
     if not event_key or not event_type:
         return f"missing-headers (topic={msg.topic} offset={msg.offset})"
 
-    try:
-        payload = json.loads(msg.value)
-    except json.JSONDecodeError:
-        # Don't keep retrying garbage — still mark it processed and skip
-        logger.warning("events-archiver: non-JSON value on %s offset=%d", msg.topic, msg.offset)
+    async with use_traceparent(traceparent):
+        try:
+            payload = json.loads(msg.value)
+        except json.JSONDecodeError:
+            logger.warning(
+                "events-archiver: non-JSON value on %s offset=%d", msg.topic, msg.offset
+            )
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    await processed_events_repo.claim(
+                        session, consumer=CONSUMER_NAME, event_key=event_key
+                    )
+            return f"bad-json {event_key}"
+
         async with AsyncSessionLocal() as session:
             async with session.begin():
-                await processed_events_repo.claim(
+                claimed = await processed_events_repo.claim(
                     session, consumer=CONSUMER_NAME, event_key=event_key
                 )
-        return f"bad-json {event_key}"
+                if not claimed:
+                    return f"duplicate {event_key}"
 
-    # Claim first (Postgres), then upsert to Mongo, then commit Postgres.
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            claimed = await processed_events_repo.claim(
-                session, consumer=CONSUMER_NAME, event_key=event_key
-            )
-            if not claimed:
-                return f"duplicate {event_key}"
-
-            doc = {
-                "event_key": event_key,
-                "event_type": event_type,
-                "payload": payload,
-                "kafka": {
-                    "topic": msg.topic,
-                    "partition": msg.partition,
-                    "offset": msg.offset,
-                    "timestamp_ms": msg.timestamp,
-                },
-                "archived_at": datetime.now(timezone.utc),
-            }
-            # $setOnInsert makes this a no-op when the doc already exists —
-            # belt-and-suspenders alongside the Postgres claim.
-            coll = get_events_collection()
-            await coll.update_one(
-                {"event_key": event_key},
-                {"$setOnInsert": doc},
-                upsert=True,
-            )
-            return f"archived {event_type} {event_key}"
+                doc = {
+                    "event_key": event_key,
+                    "event_type": event_type,
+                    "payload": payload,
+                    "kafka": {
+                        "topic": msg.topic,
+                        "partition": msg.partition,
+                        "offset": msg.offset,
+                        "timestamp_ms": msg.timestamp,
+                    },
+                    "archived_at": datetime.now(timezone.utc),
+                }
+                coll = get_events_collection()
+                await coll.update_one(
+                    {"event_key": event_key},
+                    {"$setOnInsert": doc},
+                    upsert=True,
+                )
+                return f"archived {event_type} {event_key}"
 
 
 async def _run() -> None:

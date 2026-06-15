@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # ── Redis ─────────────────────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
+    cache_enabled: bool = True  # best-effort hot-path cache; turned off under test
 
     # ── RabbitMQ ──────────────────────────────────────────────────────────────
     rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
@@ -58,6 +59,22 @@ class Settings(BaseSettings):
     rag_top_k: int = 3                            # fewer chunks → shorter prompt → less prefill time
     rag_min_similarity: float = 0.25              # drop weak matches; keeps context focused
     rag_max_chunk_tokens: int = 200               # cap each excerpt — prefill scales with prompt length
+
+    # ── SMTP (Tier 2 — Mailhog in dev) ────────────────────────────────────────
+    smtp_enabled: bool = True
+    smtp_host: str = "localhost"
+    smtp_port: int = 1025
+    smtp_use_tls: bool = False
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "SmartCourse <noreply@smartcourse.local>"
+
+    # ── Dev seed users (created once by migrate) ──────────────────────────────
+    seed_dev_users: bool = True
+    dev_admin_email: str = "admin@smartcourse.local"
+    dev_admin_password: str = "SmartCourseAdmin1!"
+    dev_instructor_email: str = "instructor@smartcourse.local"
+    dev_instructor_password: str = "SmartCourseInstruct1!"
 
     @property
     def is_development(self) -> bool:

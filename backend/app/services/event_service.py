@@ -10,7 +10,9 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.events import schema_registry
 from app.observability.metrics import events_emitted_total
+from app.observability.propagation import inject_traceparent
 from app.repositories import outbox_repo
 
 
@@ -31,8 +33,16 @@ async def emit(
     (e.g. f"enrollment-{enrollment_id}"). Consumers dedupe on it so retries
     on the relay → Kafka leg don't cause double side-effects downstream.
     """
+    # Producer-side contract gate — reject a malformed payload before it is
+    # staged. Same role as a Schema Registry rejecting an incompatible produce.
+    schema_registry.validate(event_type, payload)
+
     await outbox_repo.enqueue(
-        db, event_type=event_type, event_key=event_key, payload=payload
+        db,
+        event_type=event_type,
+        event_key=event_key,
+        payload=payload,
+        traceparent=inject_traceparent(),
     )
     # path="outbox" — distinguishes these from `direct` Kafka publishes from
     # inside a Temporal activity (course.published).

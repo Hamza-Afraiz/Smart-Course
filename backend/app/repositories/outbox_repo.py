@@ -13,6 +13,7 @@ async def enqueue(
     event_type: str,
     event_key: str,
     payload: dict[str, Any],
+    traceparent: str | None = None,
 ) -> OutboxEvent:
     """Stage an event for the relay. Caller's transaction owns the commit —
     the row is only durably present once the caller's TX commits, which is
@@ -22,6 +23,7 @@ async def enqueue(
         event_type=event_type,
         event_key=event_key,
         payload=payload,
+        traceparent=traceparent,
     )
     db.add(event)
     await db.flush()

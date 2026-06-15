@@ -60,6 +60,13 @@ export default function MyEnrollmentsPage() {
                   {e.progress_summary.total_lessons} lessons ·{" "}
                   {e.progress_summary.percent}%
                 </p>
+                {e.status === "completed" && (
+                  <p className="muted small">
+                    <Link to="/my-certificates" onClick={(ev) => ev.stopPropagation()}>
+                      View certificate →
+                    </Link>
+                  </p>
+                )}
               </div>
             </Link>
           ))}

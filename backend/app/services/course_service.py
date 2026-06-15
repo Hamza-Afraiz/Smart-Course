@@ -3,14 +3,17 @@ import uuid
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import cache
 from app.exceptions import (
     CourseNotFoundError,
+    CourseNotPublishedError,
     ForbiddenError,
     InvalidStatusTransitionError,
 )
 from app.models.course import Course, CourseStatus
 from app.models.user import User, UserRole
 from app.repositories import course_repo
+from app.schemas.course import CourseResponse
 
 # allowed status transitions — anything else raises InvalidStatusTransitionError
 _ALLOWED_TRANSITIONS: dict[CourseStatus, set[CourseStatus]] = {
@@ -22,6 +25,24 @@ _ALLOWED_TRANSITIONS: dict[CourseStatus, set[CourseStatus]] = {
 
 def _can_modify(user: User, course: Course) -> bool:
     return user.role == UserRole.admin or course.instructor_id == user.id
+
+
+# ── Hot-path cache ────────────────────────────────────────────────────────────
+# Two hot reads sit in front of Postgres: the published catalog and course detail.
+# Catalog keys carry a generation number so one INCR invalidates every page.
+_CATALOG_VERSION_KEY = "course:catalog:version"
+_DETAIL_TTL_SECONDS = 60
+_CATALOG_TTL_SECONDS = 30
+
+
+def _detail_key(course_id: uuid.UUID) -> str:
+    return f"course:detail:{course_id}"
+
+
+async def invalidate_course_cache(course_id: uuid.UUID) -> None:
+    """Drop a course's cached detail and roll the catalog generation forward."""
+    await cache.delete(_detail_key(course_id))
+    await cache.bump(_CATALOG_VERSION_KEY)
 
 
 async def get_for_view(db: AsyncSession, course_id: uuid.UUID, viewer: User) -> Course:
@@ -60,6 +81,42 @@ async def list_owned(
     return await course_repo.list_by_instructor(
         db, instructor.id, limit=limit, offset=offset
     )
+
+
+async def get_course_detail(
+    db: AsyncSession, course_id: uuid.UUID, viewer: User
+) -> CourseResponse:
+    """Cached read of one course. Only *published* courses are cached — draft and
+    archived visibility depends on the viewer, so those always hit the DB."""
+    key = _detail_key(course_id)
+    cached = await cache.get_json(key)
+    if cached is not None:
+        return CourseResponse.model_validate(cached)
+
+    course = await get_for_view(db, course_id, viewer)
+    resp = CourseResponse.model_validate(course)
+    if course.status == CourseStatus.published:
+        await cache.set_json(key, resp.model_dump(mode="json"), _DETAIL_TTL_SECONDS)
+    return resp
+
+
+async def list_catalog(
+    db: AsyncSession, *, limit: int, offset: int
+) -> list[CourseResponse]:
+    """Cached read of the published catalog. The key carries a generation number
+    so a publish / update / archive invalidates every page with one INCR."""
+    version = await cache.get_int(_CATALOG_VERSION_KEY)
+    key = f"course:catalog:v{version}:{limit}:{offset}"
+    cached = await cache.get_json(key)
+    if cached is not None:
+        return [CourseResponse.model_validate(c) for c in cached]
+
+    courses = await course_repo.list_published(db, limit=limit, offset=offset)
+    resps = [CourseResponse.model_validate(c) for c in courses]
+    await cache.set_json(
+        key, [r.model_dump(mode="json") for r in resps], _CATALOG_TTL_SECONDS
+    )
+    return resps
 
 
 async def create(
@@ -113,6 +170,7 @@ async def update(
     # onupdate=func.now() on updated_at expires the attr after flush — refresh inside
     # the async context so Pydantic serialization doesn't trigger a sync lazy-load
     await db.refresh(course)
+    await invalidate_course_cache(course.id)
     return course
 
 
@@ -122,4 +180,20 @@ async def soft_delete(db: AsyncSession, *, course_id: uuid.UUID, actor: User) ->
     course.status = CourseStatus.archived
     await db.flush()
     await db.refresh(course)
+    await invalidate_course_cache(course.id)
     return course
+
+
+async def trigger_reindex(
+    db: AsyncSession, *, course_id: uuid.UUID, actor: User
+) -> uuid.UUID:
+    """Enqueue Celery re-index for a published course (owner or admin)."""
+    course = await get_for_modify(db, course_id, actor)
+    if course.status != CourseStatus.published:
+        raise CourseNotPublishedError("Re-index requires a published course")
+
+    from app.observability.propagation import inject_traceparent
+    from app.tasks.reindex_course import reindex_course
+
+    reindex_course.delay(str(course_id), inject_traceparent())
+    return course_id

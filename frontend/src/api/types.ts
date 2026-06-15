@@ -32,6 +32,21 @@ export interface Course {
   updated_at: string;
 }
 
+export interface PrerequisiteCourse {
+  id: string;
+  title: string;
+  status: CourseStatus;
+}
+
+export interface CourseRecommendation {
+  id: string;
+  title: string;
+  description: string | null;
+  instructor_id: string;
+  status: CourseStatus;
+  popularity: number;
+}
+
 export interface Module {
   id: string;
   course_id: string;
@@ -99,6 +114,22 @@ export interface PublishStatus {
   status: string;
 }
 
+export interface ReindexAccepted {
+  status: string;
+  course_id: string;
+  task: string;
+}
+
+export interface Certificate {
+  id: string;
+  enrollment_id: string;
+  student_id: string;
+  course_id: string;
+  issued_at: string;
+  certificate_url: string | null;
+  course_title: string | null;
+}
+
 // ── Admin / Metrics ──────────────────────────────────────────────────────────
 
 export interface OverviewMetrics {
@@ -146,6 +177,19 @@ export interface RecentActivityItem {
 
 export interface RecentActivity {
   items: RecentActivityItem[];
+}
+
+export interface OutboxHealth {
+  pending_count: number;
+  oldest_pending_seconds: number | null;
+  pending_by_type: Record<string, number>;
+}
+
+export interface PipelineHealth {
+  status: "healthy" | "degraded" | "critical";
+  outbox: OutboxHealth;
+  consumer_errors_total: number;
+  hints: string[];
 }
 
 // ── Semantic search (Week 4) ─────────────────────────────────────────────────

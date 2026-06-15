@@ -7,6 +7,7 @@ import CatalogPage from "./pages/CatalogPage";
 import CourseDetailPage from "./pages/CourseDetailPage";
 import MyCoursesPage from "./pages/MyCoursesPage";
 import MyEnrollmentsPage from "./pages/MyEnrollmentsPage";
+import MyCertificatesPage from "./pages/MyCertificatesPage";
 import ProfilePage from "./pages/ProfilePage";
 import AdminMetricsPage from "./pages/AdminMetricsPage";
 
@@ -38,6 +39,14 @@ export default function App() {
           element={
             <ProtectedRoute roles={["student"]}>
               <MyEnrollmentsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/my-certificates"
+          element={
+            <ProtectedRoute roles={["student"]}>
+              <MyCertificatesPage />
             </ProtectedRoute>
           }
         />

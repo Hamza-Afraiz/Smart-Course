@@ -34,6 +34,36 @@ async def owned_course_ids(db: AsyncSession, instructor_id: uuid.UUID) -> list[u
     return [row[0] for row in result.all()]
 
 
+async def list_chunks_for_lesson(
+    db: AsyncSession, *, lesson_id: uuid.UUID, course_id: uuid.UUID
+) -> list[dict]:
+    """All chunks for one lesson, in reading order — used for instructor generation."""
+    stmt = (
+        select(
+            LessonChunk.lesson_id,
+            Lesson.title.label("lesson_title"),
+            LessonChunk.chunk_index,
+            LessonChunk.text,
+        )
+        .join(Lesson, Lesson.id == LessonChunk.lesson_id)
+        .where(
+            LessonChunk.lesson_id == lesson_id,
+            LessonChunk.course_id == course_id,
+        )
+        .order_by(LessonChunk.chunk_index)
+    )
+    result = await db.execute(stmt)
+    return [
+        {
+            "lesson_id": row.lesson_id,
+            "lesson_title": row.lesson_title,
+            "chunk_index": row.chunk_index,
+            "text": row.text,
+        }
+        for row in result.all()
+    ]
+
+
 async def search_chunks(
     db: AsyncSession,
     *,

@@ -2,14 +2,14 @@
 
 Intelligent learning platform — a FastAPI async backend with a React + Vite single-page frontend. Part of a 5-week mentored engineering assignment focused on distributed-systems design.
 
-**Current status:** Week 2 complete (enrollment + Temporal publish) + a React UI for testing the full flow — see [docs/PROGRESS.md](docs/PROGRESS.md) for the full 5-week tracker.
+**Current status:** All 5 weeks complete — enrollment, Temporal publish, Kafka events, observability, pgvector retrieval, RAG Q&A, instructor summary/quiz generation, and Tier 2 polish (Mailhog email, certificates, traceparent, re-index, dev seed users). React UI for the full flow. See [docs/PROGRESS.md](docs/PROGRESS.md) for the tracker.
 
 ## Repository layout
 
 ```
 Smart-Course/
   backend/      # FastAPI app, Alembic migrations, Temporal worker, pytest suite,
-                #   Dockerfile + docker-compose.yml (full stack; Kafka behind a week3 profile)
+                #   Dockerfile + docker-compose.yml (full stack incl. Kafka, Mongo, Ollama, observability)
   frontend/     # React + Vite + TypeScript SPA
   docs/         # PRD, API reference, schema, week plans, Q&A log
 ```
@@ -42,7 +42,7 @@ Backend and frontend are independent — each has its own dependencies and dev s
 └────────────┘      └────────────┘   └────────────┘
 ```
 
-PostgreSQL is the source of truth. Redis and RabbitMQ are wired up for Week 2/3 (caching, Celery, Kafka events, Temporal workflows).
+PostgreSQL is the source of truth. Redis, RabbitMQ, Kafka, Temporal, MongoDB, MinIO, and Ollama are wired for caching, events, workflows, analytics, media storage, and local LLM inference.
 
 ### Layered request flow
 
@@ -124,6 +124,15 @@ cp backend/.env.example backend/.env
 
 Open `backend/.env` and set `SECRET_KEY` to any long random string. Everything else works as-is for local dev.
 
+**Dev seed users** — `migrate` runs `app.scripts.seed_dev_users` after Alembic. Default logins (override in `.env`):
+
+| Role | Email | Password |
+|---|---|---|
+| Admin | `admin@smartcourse.local` | `SmartCourseAdmin1!` |
+| Instructor | `instructor@smartcourse.local` | `SmartCourseInstruct1!` |
+
+Set `SEED_DEV_USERS=false` to skip. Register additional students via the UI or `POST /auth/register`.
+
 ### 3. Start the backend (Docker — recommended)
 
 ```bash
@@ -132,7 +141,7 @@ docker-compose up -d --build    # reads backend/.env
 docker-compose ps               # all services should be healthy
 ```
 
-One command brings up the whole backend: postgres, redis, rabbitmq, temporal, temporal-ui, `migrate` (applies Alembic migrations, then exits), `api` (port 8000), and `worker` (the Temporal worker). `api` and `worker` are the same image (`backend/Dockerfile`) with different commands; source is bind-mounted, so host edits hot-reload both.
+One command brings up the whole backend: postgres, redis, rabbitmq, temporal, temporal-ui, **mailhog**, `migrate` (Alembic + dev seed, then exits), `api` (port 8000), `worker`, relay, Kafka consumers, and celery-worker. `api` and `worker` are the same image (`backend/Dockerfile`) with different commands; source is bind-mounted, so host edits hot-reload both.
 
 DB connection (DBeaver / psql):
 ```
@@ -196,6 +205,7 @@ All routes live under `/api/v1/`. Auth uses OAuth2 password flow (form data); ev
 | PATCH | `/courses/{id}` | Update course; status: draft→archived, published→archived only | owner / admin |
 | POST | `/courses/{id}/publish` | Start Temporal publish workflow | instructor / admin |
 | GET | `/courses/{id}/publish/status` | Publish workflow status | instructor / admin |
+| POST | `/courses/{id}/reindex` | Re-chunk/embed a published course (202, Celery) | owner / admin |
 | DELETE | `/courses/{id}` | Soft-delete (archive) | owner / admin |
 | POST | `/courses/{id}/modules` | Add module | owner / admin |
 | GET | `/courses/{id}/modules` | List modules | any |
@@ -204,10 +214,36 @@ All routes live under `/api/v1/`. Auth uses OAuth2 password flow (form data); ev
 | POST | `/courses/{id}/enroll` | Enroll in a course | student |
 | GET | `/enrollments/me` | List own enrollments + progress summary | student |
 | GET | `/enrollments/{eid}/progress` | List completed-lesson rows for an enrollment | student (owner) |
-| POST | `/enrollments/{eid}/progress/{lid}` | Mark a lesson complete (idempotent) | student (owner) |
+| POST | `/enrollments/{eid}/progress/{lid}` | Mark a lesson complete (idempotent); issues certificate when course done | student (owner) |
+| GET | `/certificates/me` | List certificates for completed enrollments | student |
+| POST | `/search/semantic` | Semantic search over lesson chunks (optional course scope) | any |
+| POST | `/search/my` | Global search across enrolled/owned courses | any |
+| POST | `/assistant/ask` | RAG Q&A over a course (SSE stream) | any |
+| POST | `/assistant/generate` | Instructor summary or quiz from indexed content (SSE) | instructor / admin |
+| POST | `/uploads` | Presigned URL for lesson file upload (MinIO) | instructor / admin |
+| GET | `/admin/metrics/overview` | Platform counts | admin |
+| GET | `/admin/metrics/enrollments-over-time` | Daily enrollment series | admin |
+| GET | `/admin/metrics/popular-courses` | Top courses by enrollment | admin |
+| GET | `/admin/metrics/completion` | Completion rate + avg time | admin |
+| GET | `/admin/metrics/recent-activity` | Latest events from Mongo log | admin |
+| GET | `/admin/metrics/pipeline-health` | Outbox backlog + pipeline status (PRD §5) | admin |
 
 Full request/response examples and error codes → [docs/API.md](docs/API.md).
 Interactive docs while server is running → [http://localhost:8000/docs](http://localhost:8000/docs).
+Demo walkthrough + UC checklist → [docs/DEMO_RUNBOOK.md](docs/DEMO_RUNBOOK.md).
+
+### Observability (local dev)
+
+| What | URL |
+|---|---|
+| Grafana dashboards | http://localhost:3000 (login `admin` / `admin`) |
+| Prometheus | http://localhost:9090 |
+| Jaeger traces | http://localhost:16686 |
+| Mailhog (welcome emails) | http://localhost:8025 |
+| Kafka UI | http://localhost:8081 |
+| Temporal UI | http://localhost:8080 |
+| RabbitMQ management | http://localhost:15672 |
+| MinIO console | http://localhost:9001 |
 
 ---
 
@@ -227,13 +263,7 @@ The first run creates a separate `smartcourse_test` database automatically. Each
 
 ## Services & profiles
 
-`docker-compose up -d` (from `backend/`) starts the full backend — infra + temporal + migrate + api + worker. Only genuinely opt-in services sit behind a `profiles:` flag; right now that's just Kafka, which isn't built yet:
-
-### Week 3 — Kafka (not started)
-
-```bash
-docker-compose --profile week3 up -d
-```
+`docker-compose up -d` (from `backend/`) starts the full stack — infra, Temporal, Kafka, Mongo, MinIO, Ollama, Mailhog, observability, migrate (Alembic + seed), api, worker, relay, celery-worker, and event consumers. No profile flags required for core functionality.
 
 ### Useful
 
@@ -245,6 +275,8 @@ docker-compose down                   # stop the stack (volumes persist)
 
 The API connects to Temporal on startup (`TEMPORAL_HOST`). If Temporal is unreachable the app still starts; `POST .../publish` returns **503** until it's back.
 
+First run pulls the Ollama model (`llama3.2:1b` by default) via the `ollama-pull` init container — allow a few minutes on a cold start.
+
 ---
 
 ## Project structure
@@ -252,29 +284,30 @@ The API connects to Temporal on startup (`TEMPORAL_HOST`). If Temporal is unreac
 ```
 backend/
   app/
-    routers/         # HTTP layer — auth.py, users.py, courses.py, enrollments.py
-    services/        # Business logic — auth, user, course, module, lesson, enrollment, publish
-    repositories/    # DB queries — user, course, module, lesson, enrollment, progress repos
+    routers/         # HTTP layer — auth, users, courses, enrollments, certificates, search, assistant, uploads, metrics
+    services/        # Business logic — auth, course, enrollment, certificate, search, RAG, LLM, email, indexing, metrics
+    repositories/    # DB queries — user, course, enrollment, certificate, search repos
     models/          # SQLAlchemy ORM models (one file per table)
     schemas/         # Pydantic v2 request/response schemas
     temporal/        # Temporal workflows + activities (course publishing saga)
-    workers/         # Temporal worker entrypoint (separate process)
+    workers/         # Temporal worker, outbox relay, Kafka consumers, Celery
     dependencies.py  # FastAPI dependency injection (JWT auth, DB session, roles)
     config.py        # Settings loaded from .env via pydantic-settings
     database.py      # Async engine + AsyncSessionLocal factory
     exceptions.py    # Domain exceptions (services raise, routers convert)
     main.py          # FastAPI app, lifespan, middleware, router registration
   alembic/           # Database migrations
-  tests/             # Pytest suite — conftest + test_users / test_courses / test_enrollments / test_temporal_publish
+  observability/     # Prometheus, Grafana dashboards, blackbox config
+  tests/             # Pytest suite
   requirements.txt   # production deps  (requirements-dev.txt adds test + lint tooling)
-  Dockerfile         # one image, run as migrate / api / worker
-  docker-compose.yml # full stack — postgres, redis, rabbitmq, temporal, migrate, api, worker
+  Dockerfile         # one image, run as migrate / api / worker / relay / consumers
+  docker-compose.yml # full stack
 frontend/
   src/
-    api/             # axios client + typed wrappers per resource
+    api/             # axios client + typed wrappers (courses, assistant, search, generation, uploads)
     auth/            # AuthContext — JWT + /users/me, no server session
-    components/      # Layout, ProtectedRoute, shared UI primitives
-    pages/           # Login, Register, Catalog, CourseDetail, MyCourses, MyEnrollments, Profile
+    components/      # Layout, GlobalSearch, shared UI primitives
+    pages/           # Login, Register, Catalog, CourseDetail (+ AssistantPanel, GenerationPanel), MyCertificates, AdminMetrics
 docs/                # PART_A (verbatim spec), PRD + traceability, schema, week plans, Q&A log
 ```
 

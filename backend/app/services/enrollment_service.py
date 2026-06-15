@@ -13,12 +13,18 @@ from app.exceptions import (
     EnrollmentNotFoundError,
     ForbiddenError,
     LessonNotInCourseError,
+    PrerequisitesNotMetError,
 )
 from app.models.course import CourseStatus
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.progress import Progress
 from app.models.user import User
-from app.repositories import enrollment_repo, lesson_repo, progress_repo
+from app.repositories import (
+    enrollment_repo,
+    lesson_repo,
+    prerequisite_repo,
+    progress_repo,
+)
 from app.schemas.enrollment import ProgressSummary
 from app.services import event_service
 
@@ -45,6 +51,15 @@ async def enroll(
         raise CourseNotPublishedError(
             f"Cannot enroll in a {course.status.value} course"
         )
+
+    # Prerequisite gate — block until every required course is *completed*.
+    # Runs while we still hold the FOR UPDATE lock from lock_course_for_enrollment,
+    # so it's part of the same all-or-nothing enrollment transaction.
+    unmet = await prerequisite_repo.unmet_prerequisites(
+        db, student_id=student.id, course_id=course_id
+    )
+    if unmet:
+        raise PrerequisitesNotMetError(unmet)
 
     if course.max_students is not None:
         active = await enrollment_repo.count_active(db, course_id)
@@ -192,6 +207,9 @@ async def complete_lesson(
             enrollment.status = EnrollmentStatus.completed
             enrollment.completed_at = datetime.now(timezone.utc)
             await db.flush()
+            from app.services import certificate_service
+
+            await certificate_service.issue_for_enrollment(db, enrollment)
 
     return progress
 

@@ -7,6 +7,7 @@ import {
   listLessons,
   listModules,
   publishCourse,
+  reindexCourse,
 } from "../api/courses";
 import {
   completeLesson,
@@ -33,6 +34,8 @@ import ModuleManager from "./course-detail/ModuleManager";
 import LessonList from "./course-detail/LessonList";
 import SearchPanel from "./course-detail/SearchPanel";
 import AssistantPanel from "./course-detail/AssistantPanel";
+import GenerationPanel from "./course-detail/GenerationPanel";
+import PrerequisitePanel from "./course-detail/PrerequisitePanel";
 
 export default function CourseDetailPage() {
   const { courseId = "" } = useParams();
@@ -45,6 +48,9 @@ export default function CourseDetailPage() {
   >({});
   const [enrollment, setEnrollment] = useState<EnrollmentWithCourse | null>(null);
   const [completedLessonIds, setCompletedLessonIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [completedCourseIds, setCompletedCourseIds] = useState<Set<string>>(
     new Set(),
   );
 
@@ -73,10 +79,16 @@ export default function CourseDetailPage() {
 
       let myEnrollment: EnrollmentWithCourse | null = null;
       let completed = new Set<string>();
+      let completedCourses = new Set<string>();
       if (user?.role === "student") {
         const enrollments = await listMyEnrollments();
         myEnrollment =
           enrollments.find((e) => e.course_id === courseId) ?? null;
+        completedCourses = new Set(
+          enrollments
+            .filter((e) => e.status === "completed")
+            .map((e) => e.course_id),
+        );
         if (myEnrollment) {
           const progress = await listProgress(myEnrollment.id);
           completed = new Set(progress.map((p) => p.lesson_id));
@@ -88,6 +100,7 @@ export default function CourseDetailPage() {
       setLessonsByModule(Object.fromEntries(lessonEntries));
       setEnrollment(myEnrollment);
       setCompletedLessonIds(completed);
+      setCompletedCourseIds(completedCourses);
     } catch (err) {
       setError(errorMessage(err, "Could not load this course"));
     } finally {
@@ -123,7 +136,6 @@ export default function CourseDetailPage() {
       setNotice(
         "Publish workflow started. Temporal is validating and processing the course — status updates below.",
       );
-      // Poll the workflow a handful of times so the UI reflects completion.
       for (let i = 0; i < 8; i++) {
         await new Promise((r) => setTimeout(r, 2000));
         await refreshPublishStatus();
@@ -131,6 +143,29 @@ export default function CourseDetailPage() {
       await loadAll();
     } catch (err) {
       setActionError(errorMessage(err, "Publish failed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleReindex = async () => {
+    if (
+      !confirm(
+        "Re-index all lessons? This re-chunks and re-embeds content for search and the assistant.",
+      )
+    ) {
+      return;
+    }
+    setActionError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      await reindexCourse(courseId);
+      setNotice(
+        "Re-index queued. Search and assistant will reflect updated content after the background task finishes.",
+      );
+    } catch (err) {
+      setActionError(errorMessage(err, "Re-index failed"));
     } finally {
       setBusy(false);
     }
@@ -196,6 +231,7 @@ export default function CourseDetailPage() {
     (sum, l) => sum + l.length,
     0,
   );
+  const allLessons = modules.flatMap((m) => lessonsByModule[m.id] ?? []);
 
   return (
     <div className="container">
@@ -235,6 +271,20 @@ export default function CourseDetailPage() {
                 }
               >
                 {busy ? "Working…" : "Publish course"}
+              </button>
+            )}
+            {course.status === "published" && (
+              <button
+                className="btn btn-ghost"
+                onClick={handleReindex}
+                disabled={busy || totalLessons === 0}
+                title={
+                  totalLessons === 0
+                    ? "Add lessons before re-indexing"
+                    : "Re-chunk and re-embed lesson content"
+                }
+              >
+                {busy ? "Working…" : "Re-index content"}
               </button>
             )}
             {course.status !== "archived" && (
@@ -282,6 +332,12 @@ export default function CourseDetailPage() {
                 {enrollment.progress_summary.total_lessons} lessons completed (
                 {enrollment.progress_summary.percent}%)
               </p>
+              {enrollment.status === "completed" && (
+                <p className="muted small">
+                  Course complete — view your{" "}
+                  <Link to="/my-certificates">certificate</Link>.
+                </p>
+              )}
             </>
           ) : (
             <>
@@ -301,6 +357,19 @@ export default function CourseDetailPage() {
             </>
           )}
         </section>
+      )}
+
+      {/* ── Prerequisites (owner manages · student sees met/unmet) ─────── */}
+      <PrerequisitePanel
+        courseId={courseId}
+        isOwner={isOwner}
+        isStudent={isStudent}
+        completedCourseIds={completedCourseIds}
+      />
+
+      {/* ── Instructor content generation (RAG — summary / quiz) ─────── */}
+      {isOwner && course.status === "published" && (
+        <GenerationPanel courseId={courseId} lessons={allLessons} />
       )}
 
       {/* ── Ask this course (semantic search + RAG assistant) ─────────── */}

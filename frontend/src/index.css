@@ -579,6 +579,41 @@ textarea {
   font-size: 1.02rem;
 }
 
+/* ── Certificates ───────────────────────────────────────────────────────── */
+
+.certificate-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.certificate-card {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+.certificate-badge {
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: #e8f5e9;
+  color: #2e7d32;
+  font-size: 1.25rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.certificate-body h2 {
+  font-size: 1.05rem;
+  margin: 0 0 6px;
+}
+
 /* ── Detail grid (profile) ──────────────────────────────────────────────── */
 
 .detail-grid {
@@ -638,6 +673,43 @@ textarea {
   gap: 20px;
   margin-bottom: 20px;
 }
+
+.pipeline-health-panel {
+  margin-bottom: 20px;
+}
+.pipeline-health-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+.pipeline-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.pipeline-healthy {
+  background: #dcfce7;
+  color: #166534;
+}
+.pipeline-degraded {
+  background: #fef9c3;
+  color: #854d0e;
+}
+.pipeline-critical {
+  background: #fee2e2;
+  color: #991b1b;
+}
+.pipeline-hints {
+  margin: 10px 0 0;
+  padding-left: 1.2rem;
+}
+
 @media (max-width: 800px) {
   .metrics-row {
     grid-template-columns: 1fr;
@@ -1035,4 +1107,28 @@ textarea {
 }
 .assistant-form input {
   flex: 1;
+}
+
+/* ── Prerequisites + recommendations ─────────────────────────────────── */
+.prereq-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.prereq-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.prereq-item a {
+  font-weight: 500;
+}
+.rec-section {
+  margin-bottom: 20px;
+}
+.rec-pop {
+  white-space: nowrap;
 }

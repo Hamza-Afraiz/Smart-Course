@@ -56,6 +56,14 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Dev SMTP sink — welcome emails land here (UI http://localhost:8025).
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    restart: unless-stopped
+
   # ─── Temporal (workflow engine) — core since Week 2 ─────────────────────────
 
   temporal:
@@ -256,7 +264,7 @@ services:
   migrate:
     image: smart-course-app
     build: .
-    command: alembic upgrade head
+    command: sh -c "alembic upgrade head && python -m app.scripts.seed_dev_users"
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
@@ -285,6 +293,9 @@ services:
       RAG_TOP_K: 3
       RAG_MIN_SIMILARITY: 0.25
       RAG_MAX_CHUNK_TOKENS: 200
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_ENABLED: "true"
     ports:
       - "8000:8000"
     volumes:
@@ -449,6 +460,11 @@ services:
       CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       CELERY_RESULT_BACKEND: redis://redis:6379/1
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_ENABLED: "true"
+      S3_INTERNAL_ENDPOINT: http://minio:9000
+      OLLAMA_HOST: http://ollama:11434
     volumes:
       - ./app:/app/app
     depends_on:
@@ -457,6 +473,12 @@ services:
       rabbitmq:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     restart: unless-stopped
 

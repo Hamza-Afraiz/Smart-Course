@@ -43,3 +43,5 @@ class OutboxEvent(Base):
     )
     # NULL = not yet published to Kafka. Set by the relay on successful send.
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # W3C traceparent captured at emit time — relay forwards it in Kafka headers.
+    traceparent: Mapped[str | None] = mapped_column(String(255))

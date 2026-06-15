@@ -41,11 +41,71 @@
       "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 } }
     },
     {
+      "id": 12,
+      "type": "stat",
+      "title": "Outbox backlog (pending)",
+      "description": "Rows with sent_at IS NULL — rises when relay or Kafka is down (PRD failed-events signal).",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "smartcourse_outbox_pending", "refId": "A" }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Consumer errors (total)",
+      "description": "Kafka consumer handlers that recorded outcome=error.",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(smartcourse_events_consumed_total{outcome=\"error\"})",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
       "id": 3,
       "type": "stat",
       "title": "Events archived (total)",
       "description": "Rows written to MongoDB by the events-archiver consumer.",
-      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "sum(smartcourse_events_archived_total)", "refId": "A" }

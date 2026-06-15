@@ -5,6 +5,7 @@ import type {
   Module,
   PublishAccepted,
   PublishStatus,
+  ReindexAccepted,
 } from "./types";
 
 export async function listPublished(limit = 50, offset = 0): Promise<Course[]> {
@@ -90,5 +91,10 @@ export async function publishCourse(courseId: string): Promise<PublishAccepted> 
 
 export async function getPublishStatus(courseId: string): Promise<PublishStatus> {
   const { data } = await api.get<PublishStatus>(`/courses/${courseId}/publish/status`);
+  return data;
+}
+
+export async function reindexCourse(courseId: string): Promise<ReindexAccepted> {
+  const { data } = await api.post<ReindexAccepted>(`/courses/${courseId}/reindex`);
   return data;
 }

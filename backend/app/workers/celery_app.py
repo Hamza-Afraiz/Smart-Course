@@ -36,7 +36,7 @@ celery_app = Celery(
     "smart_course",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.welcome_email"],
+    include=["app.tasks.welcome_email", "app.tasks.reindex_course"],
 )
 
 celery_app.conf.update(

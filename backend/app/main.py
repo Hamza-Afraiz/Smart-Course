@@ -49,6 +49,9 @@ async def lifespan(app: FastAPI):
         logger.warning("object storage unavailable — uploads will fail: %s", e)
 
     yield
+    from app import cache
+
+    await cache.close()
     await engine.dispose()
     logger.info("SmartCourse API shut down — connections closed")
 
@@ -102,6 +105,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 from app.routers.assistant import router as assistant_router
 from app.routers.auth import router as auth_router
+from app.routers.certificates import router as certificates_router
 from app.routers.courses import router as courses_router
 from app.routers.enrollments import router as enrollments_router
 from app.routers.metrics import router as metrics_router
@@ -113,6 +117,7 @@ app.include_router(auth_router, prefix="/api/v1/auth")
 app.include_router(users_router, prefix="/api/v1/users")
 app.include_router(courses_router, prefix="/api/v1/courses")
 app.include_router(enrollments_router, prefix="/api/v1/enrollments")
+app.include_router(certificates_router, prefix="/api/v1/certificates")
 app.include_router(metrics_router, prefix="/api/v1/admin/metrics")
 app.include_router(search_router, prefix="/api/v1/search")
 app.include_router(uploads_router, prefix="/api/v1/uploads")

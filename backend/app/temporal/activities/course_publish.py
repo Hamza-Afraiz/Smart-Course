@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from aiokafka import AIOKafkaProducer
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from temporalio import activity
@@ -22,8 +22,7 @@ from temporalio.exceptions import ApplicationError
 
 from app.config import settings
 from app.models.course import Course, CourseStatus
-from app.models.lesson import ContentType, Lesson
-from app.models.lesson_chunk import LessonChunk
+from app.models.lesson import Lesson
 from app.models.module import Module
 
 _activity_session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -97,19 +96,8 @@ async def validate_course_activity(course_id: str, instructor_id: str) -> None:
 
 @activity.defn
 async def process_lessons_activity(course_id: str, idempotency_key: str) -> None:
-    """Week 4 — chunk every lesson and embed it into pgvector.
-
-    Idempotency: we DELETE existing chunks for this course before reinserting
-    (a publish workflow re-run produces the same chunks). The idempotency
-    key is preserved in the workflow history; the heavy work here is the
-    re-chunk + re-embed, both deterministic given the same source text.
-
-    Only `text` lessons are processed for now (video transcripts and PDF
-    extraction can be added later without changing the schema or pipeline).
-    """
-    from app.services.chunking_service import chunk_text
-    from app.services.embedding_service import embed
-    from app.services import extraction_service
+    """Week 4 — chunk every lesson and embed it into pgvector."""
+    from app.services.content_indexing_service import index_course_lessons
 
     _ = idempotency_key
     _fail_if_test_injected("process")
@@ -122,103 +110,12 @@ async def process_lessons_activity(course_id: str, idempotency_key: str) -> None
         if course is None:
             raise ApplicationError("Course not found", non_retryable=True)
 
-        # Pull every lesson in the course in one shot
-        lessons = (
-            await session.execute(
-                select(Lesson)
-                .join(Module, Lesson.module_id == Module.id)
-                .where(Module.course_id == cid)
-            )
-        ).scalars().all()
-
-        # Re-run safe: wipe & repopulate this course's chunks
-        await session.execute(
-            delete(LessonChunk).where(LessonChunk.course_id == cid)
-        )
-
-        total_chunks = 0
-        for lesson in lessons:
-            source = await _lesson_text(lesson)
-            if not source:
-                continue
-
-            chunks = chunk_text(source)
-            if not chunks:
-                continue
-
-            vectors = await embed([c.text for c in chunks])
-
-            for idx, (c, v) in enumerate(zip(chunks, vectors)):
-                session.add(
-                    LessonChunk(
-                        lesson_id=lesson.id,
-                        course_id=cid,
-                        chunk_index=idx,
-                        text=c.text,
-                        token_count=c.token_count,
-                        embedding=v,
-                    )
-                )
-                total_chunks += 1
-
-        course.processed_at = datetime.now(timezone.utc)
-        await session.flush()
+        total_chunks = await index_course_lessons(session, cid)
         activity.logger.info(
-            "process_lessons_activity: course=%s lessons=%d chunks=%d",
-            cid, len(lessons), total_chunks,
+            "process_lessons_activity: course=%s chunks=%d",
+            cid,
+            total_chunks,
         )
-
-
-async def _lesson_text(lesson: Lesson) -> str | None:
-    """Resolve a lesson's source text for chunking.
-
-      - text  → inline content_text (no network)
-      - video → cache → else YouTube transcript / Whisper (URL or uploaded bytes)
-      - pdf   → cache → else pypdf (URL or uploaded bytes)
-
-    Video/PDF results are memoised on the lesson (cached_text +
-    cached_text_source). On a re-publish with an unchanged source we reuse the
-    cache and skip the expensive Whisper/pypdf step. The write-back happens on
-    the lesson object in the live session, so it commits with the activity.
-    """
-    import asyncio as _asyncio
-
-    from app.services import extraction_service, lesson_service, storage_service
-
-    if lesson.content_type == ContentType.text:
-        return lesson.content_text or None
-
-    src = lesson_service.effective_source(lesson)
-    if src is None:
-        return None
-    fingerprint = lesson_service.source_fingerprint(lesson)
-
-    # Cache hit — skip extraction entirely
-    if lesson.cached_text and lesson.cached_text_source == fingerprint:
-        activity.logger.info("extraction cache hit for lesson=%s", lesson.id)
-        return lesson.cached_text
-
-    kind, ref = src
-    text: str | None = None
-
-    if lesson.content_type == ContentType.video:
-        if kind == "url":
-            text = await extraction_service.extract_video_text(ref)
-        else:  # uploaded file
-            data = await _asyncio.to_thread(storage_service.get_bytes, ref)
-            text = await extraction_service.transcribe_bytes(data)
-    elif lesson.content_type == ContentType.pdf:
-        if kind == "url":
-            text = await extraction_service.extract_pdf(ref)
-        else:  # uploaded file
-            data = await _asyncio.to_thread(storage_service.get_bytes, ref)
-            text = await extraction_service.extract_pdf_bytes(data)
-
-    # Write-back to cache (only on success). Persisted with the activity commit.
-    if text:
-        lesson.cached_text = text
-        lesson.cached_text_source = fingerprint
-    return text
 
 
 @activity.defn
@@ -240,6 +137,12 @@ async def mark_published_activity(course_id: str, idempotency_key: str) -> None:
         course.status = CourseStatus.published
         await session.flush()
 
+    # Course is now published — bust its cache so it appears in the catalog
+    # immediately instead of after the TTL. Best-effort; never fails the activity.
+    from app.services import course_service
+
+    await course_service.invalidate_course_cache(cid)
+
 
 @activity.defn
 async def emit_course_published_activity(course_id: str, run_id: str) -> None:
@@ -255,13 +158,26 @@ async def emit_course_published_activity(course_id: str, run_id: str) -> None:
       - event from inside a Temporal workflow → activity-direct-to-Kafka
     """
     idempotency_key = f"publish-{course_id}-{run_id}"
-    payload = json.dumps(
-        {
-            "course_id": course_id,
-            "workflow_run_id": run_id,
-            "published_at": datetime.now(timezone.utc).isoformat(),
-        }
-    ).encode()
+    from app.observability.propagation import inject_traceparent
+
+    traceparent = inject_traceparent()
+    headers: list[tuple[str, bytes]] = [
+        ("idempotency_key", idempotency_key.encode()),
+        ("event_type", b"course.published"),
+        ("source", b"temporal-workflow"),
+    ]
+    if traceparent:
+        headers.append(("traceparent", traceparent.encode()))
+
+    payload_dict = {
+        "course_id": course_id,
+        "workflow_run_id": run_id,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+    }
+    from app.events import schema_registry
+
+    schema_registry.validate("course.published", payload_dict)
+    payload = json.dumps(payload_dict).encode()
 
     producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -275,11 +191,7 @@ async def emit_course_published_activity(course_id: str, run_id: str) -> None:
             topic="events.course.published",
             key=idempotency_key.encode(),
             value=payload,
-            headers=[
-                ("idempotency_key", idempotency_key.encode()),
-                ("event_type", b"course.published"),
-                ("source", b"temporal-workflow"),
-            ],
+            headers=headers,
         )
     finally:
         await producer.stop()
